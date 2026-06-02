@@ -1644,9 +1644,70 @@ pub fn get_semantic_tokens_full(
 
     let mut tokens = vec![];
     if let Some(tree) = &tree_entry.tree {
-        let mut cursor = tree.walk();
         let source = doc.get_content(None);
-        collect_tokens(&mut cursor, &mut tokens, source);
+
+        // Pre-pass 1: collect comment ranges (byte ranges). Any other token
+        // overlapping a comment range is suppressed.
+        let mut comment_ranges: Vec<(usize, usize)> = Vec::new();
+        // Pre-pass 2: collect names defined as constants by `.equ`/`.set`/`equ`
+        // so that references to them can be classified as variable+readonly.
+        let mut constants: HashSet<String> = HashSet::new();
+        {
+            let mut c = tree.walk();
+            collect_prepass(&mut c, source, &mut comment_ranges, &mut constants);
+        }
+        // Source-level scan as a backstop: detect line-comment characters that
+        // the grammar may not expose as comment nodes (`@`, `;`, `#`, `//`).
+        // We intentionally do this even when the grammar emits some comments,
+        // because the grammar may miss architecture-specific cases.
+        scan_line_comments(source, &mut comment_ranges);
+
+        // Sort comment ranges for binary search overlap checks
+        comment_ranges.sort_by_key(|r| r.0);
+
+        let mut cursor = tree.walk();
+        collect_tokens(&mut cursor, &mut tokens, source, &constants);
+
+        // Emit a comment token for each detected comment range (if not already
+        // covered by a grammar-produced comment token at the same position).
+        for &(s, e) in &comment_ranges {
+            // Compute line/col from byte offset.
+            let prefix = &source[..s];
+            let line = prefix.bytes().filter(|b| *b == b'\n').count() as u32;
+            let line_start = prefix.rfind('\n').map_or(0, |p| p + 1);
+            let col = (s - line_start) as u32;
+            let length = (e - s) as u32;
+            if length == 0 {
+                continue;
+            }
+            let already = tokens.iter().any(|t| {
+                t.token_type == 7 && t.start_byte <= s && t.end_byte >= e
+            });
+            if !already {
+                tokens.push(RawToken {
+                    line,
+                    start: col,
+                    length,
+                    token_type: 7,
+                    token_modifiers_bitset: 0,
+                    start_byte: s,
+                    end_byte: e,
+                });
+            }
+        }
+
+        // Suppress any non-comment token contained within a comment range, and
+        // drop empty tokens.
+        tokens.retain(|t| {
+            if t.length == 0 {
+                return false;
+            }
+            // token 7 == comment, always keep
+            if t.token_type == 7 {
+                return true;
+            }
+            !is_in_comment(t.start_byte, t.end_byte, &comment_ranges)
+        });
     }
 
     // Sort tokens by line, then by character
@@ -1655,6 +1716,18 @@ pub fn get_semantic_tokens_full(
             a.line.cmp(&b.line)
         } else {
             a.start.cmp(&b.start)
+        }
+    });
+
+    // Remove duplicate/overlapping tokens at the same position (keep first)
+    let mut prev: Option<(u32, u32)> = None;
+    tokens.retain(|t| {
+        let key = (t.line, t.start);
+        if Some(key) == prev {
+            false
+        } else {
+            prev = Some(key);
+            true
         }
     });
 
@@ -1694,6 +1767,8 @@ struct RawToken {
     length: u32,
     token_type: u32,
     token_modifiers_bitset: u32,
+    start_byte: usize,
+    end_byte: usize,
 }
 
 fn push_token_node(node: &tree_sitter::Node, tokens: &mut Vec<RawToken>, tt: u32, mods: u32) {
@@ -1706,6 +1781,8 @@ fn push_token_node(node: &tree_sitter::Node, tokens: &mut Vec<RawToken>, tt: u32
             length: (end.column - start.column) as u32,
             token_type: tt,
             token_modifiers_bitset: mods,
+            start_byte: node.start_byte(),
+            end_byte: node.end_byte(),
         });
     }
 }
@@ -1728,172 +1805,309 @@ fn push_token_node_to_eol(
         length: end_col.saturating_sub(start.column as usize) as u32,
         token_type: tt,
         token_modifiers_bitset: mods,
+        start_byte,
+        end_byte: start_byte + rel_end,
     });
 }
 
-fn collect_tokens(cursor: &mut tree_sitter::TreeCursor, tokens: &mut Vec<RawToken>, source: &str) {
+/// Scan source line-by-line for line-comment introducers that the grammar may
+/// not expose as `comment` nodes. Recognized introducers:
+///   - `@`  (ARM convention; not used inside immediates which use `#`)
+///   - `;`  (NASM, MASM and many others)
+///   - `//` (Go assembler / C-style)
+///   - `#`  only when it is the first non-whitespace character on the line
+///          (a standalone `#` mid-line in ARM is an immediate prefix)
+///
+/// String literals are skipped so a `;` or `@` inside a string is not treated
+/// as a comment.
+fn scan_line_comments(source: &str, ranges: &mut Vec<(usize, usize)>) {
+    let bytes = source.as_bytes();
+    let mut line_start = 0usize;
+    let mut i = 0usize;
+    let mut first_non_ws: Option<usize> = None;
+    let mut in_string: Option<u8> = None;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = in_string {
+            if b == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                in_string = None;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'"' | b'\'' => {
+                in_string = Some(b);
+                i += 1;
+                continue;
+            }
+            b'\n' => {
+                line_start = i + 1;
+                first_non_ws = None;
+                i += 1;
+                continue;
+            }
+            b' ' | b'\t' | b'\r' => {
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+        if first_non_ws.is_none() {
+            first_non_ws = Some(i);
+        }
+        // Detect comment starts.
+        let is_first = first_non_ws == Some(i);
+        let is_at = b == b'@';
+        let is_semi = b == b';';
+        let is_slash2 = b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/';
+        let is_hash_first = b == b'#' && is_first;
+        if is_at || is_semi || is_slash2 || is_hash_first {
+            // Comment extends to end-of-line.
+            let mut end = i;
+            while end < bytes.len() && bytes[end] != b'\n' {
+                end += 1;
+            }
+            ranges.push((i, end));
+            i = end;
+            continue;
+        }
+        i += 1;
+    }
+    // Avoid unused-variable warning for line_start in release builds.
+    let _ = line_start;
+}
+
+/// Returns true if the [start, end) byte range overlaps any comment range.
+fn is_in_comment(start: usize, end: usize, ranges: &[(usize, usize)]) -> bool {
+    // ranges sorted by .0; linear scan acceptable, ranges typically small
+    for &(s, e) in ranges {
+        if s >= end {
+            break;
+        }
+        if start < e && end > s {
+            return true;
+        }
+    }
+    false
+}
+
+/// Walk the tree once to collect comment ranges and constant names defined by
+/// `.equ` / `.set` directives.
+fn collect_prepass(
+    cursor: &mut tree_sitter::TreeCursor,
+    source: &str,
+    comments: &mut Vec<(usize, usize)>,
+    constants: &mut HashSet<String>,
+) {
     let node = cursor.node();
     let kind = node.kind();
 
-    // Constants for modifier bit positions (must match legend order)
-    const MOD_READONLY: u32 = 1 << 0;
-    const MOD_DECL: u32 = 1 << 1;
-
-    // Try to classify this node
-    let classified = match kind {
-        // Instructions/opcodes/directives/meta identifiers
-        "opcode" | "directive" | "meta_ident" | "mnemonic" | "instruction" => {
-            push_token_node(&node, tokens, 0, 0); // keyword
-            true
+    match kind {
+        "comment" | "line_comment" | "comment_line" | "block_comment" | "comment_block" => {
+            let start_byte = node.start_byte();
+            // Extend single-line comments to end-of-line so trailing text in the
+            // same logical comment is also covered.
+            let bytes = source.as_bytes();
+            let end_byte = if kind == "block_comment" || kind == "comment_block" {
+                node.end_byte()
+            } else {
+                let rel = bytes[start_byte..]
+                    .iter()
+                    .position(|&b| b == b'\n')
+                    .map_or(bytes.len(), |p| start_byte + p);
+                rel.max(node.end_byte())
+            };
+            comments.push((start_byte, end_byte));
         }
-        // Comments (various grammars)
-        // For safety, extend to end-of-line so the whole trailing comment is highlighted.
-        "comment" | "line_comment" | "comment_line" => {
-            push_token_node_to_eol(&node, source, tokens, 7, 0);
-            true
-        }
-        // Block comments typically span multiple lines and nodes already cover them
-        "block_comment" | "comment_block" => {
-            push_token_node(&node, tokens, 7, 0);
-            true
-        }
-        // Registers (various grammars)
-        "register" | "reg" => {
-            push_token_node(&node, tokens, 1, 0); // variable
-            true
-        }
-        // Numbers
-        "integer" | "number" | "constant" | "hex_number" | "oct_number" | "bin_number" => {
-            push_token_node(&node, tokens, 5, 0);
-            true
-        }
-        // Strings
-        "string" | "string_literal" => {
-            push_token_node(&node, tokens, 6, 0);
-            true
-        }
-        // Identifiers and generic variables need context
-        "ident" | "variable" => {
-            let mut handled = false;
-            if let Some(parent) = node.parent() {
-                let pkind = parent.kind();
-                if pkind == "label" {
-                    // Label definition: function + declaration
-                    push_token_node(&node, tokens, 2, MOD_DECL);
-                    handled = true;
-                } else if pkind == "macro_definition" {
-                    push_token_node(&node, tokens, 3, 0); // macro name
-                    handled = true;
-                } else {
-                    // e.g., .equ/.set NAME, VALUE  => NAME is readonly variable
-                    // Restrict detection to directive ancestors and ensure this ident
-                    // appears before the first ',' or '=' in the directive text.
-                    let mut anc = Some(parent);
-                    for _ in 0..2 {
-                        if let Some(a) = anc {
-                            if a.kind() == "directive" {
-                                if let Ok(txt) = a.utf8_text(source.as_bytes()) {
-                                    let t = txt.trim_start();
-                                    if t.starts_with(".equ") || t.starts_with(".set") {
-                                        // Compute this ident's offset inside the directive text
-                                        let base = a.start_byte();
-                                        let id_off = node.start_byte().saturating_sub(base);
-                                        // Find first ',' or '=' in directive
-                                        let bytes = txt.as_bytes();
-                                        let sep = bytes.iter().position(|&b| b == b',' || b == b'=').unwrap_or(bytes.len());
-                                        if id_off <= sep { // LHS of directive
-                                            push_token_node(&node, tokens, 1, MOD_READONLY);
-                                            handled = true;
-                                        }
-                                    }
+        // Detect `.equ NAME, value` / `.set NAME, value` directive forms.
+        "meta" => {
+            if let Ok(text) = node.utf8_text(source.as_bytes()) {
+                let trimmed = text.trim_start();
+                let is_equ = trimmed.starts_with(".equ ")
+                    || trimmed.starts_with(".set ")
+                    || trimmed.starts_with(".equiv ")
+                    || trimmed.starts_with(".equ\t")
+                    || trimmed.starts_with(".set\t");
+                if is_equ {
+                    // Find the first child ident node (the constant name).
+                    let mut c = node.walk();
+                    if c.goto_first_child() {
+                        loop {
+                            let ch = c.node();
+                            if ch.kind() == "ident" {
+                                if let Ok(name) = ch.utf8_text(source.as_bytes()) {
+                                    constants.insert(name.to_string());
                                 }
                                 break;
                             }
-                            anc = a.parent();
-                        } else { break; }
-                    }
-                }
-            }
-
-            if !handled {
-                // Heuristics: function/label reference if inside an instruction whose mnemonic is call/branch-like
-                let mut is_call_target = false;
-                // Search upward for an ancestor instruction node
-                let mut anc = node.parent();
-                while let Some(a) = anc {
-                    let ak = a.kind();
-                    if ak == "instruction" {
-                        // Find the mnemonic/opcode child
-                        let mut c = a.walk();
-                        if c.goto_first_child() {
-                            loop {
-                                let ch = c.node();
-                                if ch.kind() == "opcode" || ch.kind() == "mnemonic" {
-                                    if let Ok(op) = ch.utf8_text(source.as_bytes()) {
-                                        let op_l = op.trim().to_ascii_lowercase();
-                                        if matches!(
-                                            op_l.as_str(),
-                                            "bl" | "blx" | "call" | "jal" | "jsr" | "bsr" | "b"
-                                        ) || (op_l.starts_with('b') && op_l.len() > 1) {
-                                            is_call_target = true;
-                                        }
-                                    }
-                                    break;
-                                }
-                                if !c.goto_next_sibling() { break; }
+                            if !c.goto_next_sibling() {
+                                break;
                             }
                         }
-                        break;
-                    }
-                    anc = a.parent();
-                }
-
-                if is_call_target {
-                    // Function reference (call). No standard "call" modifier in LSP; use plain function.
-                    push_token_node(&node, tokens, 2, 0);
-                    handled = true;
-                } else {
-                    // ARM registers often lex as idents; apply a regex heuristic, but only when
-                    // not immediately following a call-like opcode (handled above) and not part of a label/dir
-                    if let Ok(text) = node.utf8_text(source.as_bytes()) {
-                        let t = text.trim();
-                        let is_arm_reg = {
-                            // r0-r31, x0-x30, w0-w30, sp, lr, pc
-                            let tl = t.to_ascii_lowercase();
-                            let is_rxw = (tl.starts_with('r') || tl.starts_with('x') || tl.starts_with('w'))
-                                && tl.len() > 1
-                                && tl[1..].chars().all(|c| c.is_ascii_digit());
-                            is_rxw || matches!(tl.as_str(), "sp" | "lr" | "pc")
-                        };
-                        if is_arm_reg {
-                            push_token_node(&node, tokens, 1, 0);
-                            handled = true;
-                        }
                     }
                 }
             }
-
-            handled
         }
-        _ => false,
-    };
+        _ => {}
+    }
 
-    if !classified {
-        // Fallback: classify leaf nodes that look like comments for ARM-style '@' comments only
-        if node.child_count() == 0 {
-            if let Ok(txt) = node.utf8_text(source.as_bytes()) {
-                let t = txt.trim_start();
-                if t.starts_with('@') {
-                    push_token_node_to_eol(&node, source, tokens, 7, 0);
-                }
+    // Fallback comment detection for leaf nodes that start with `@` (ARM),
+    // `;` (many assemblers), `#` (gas-style line comments) when grammar
+    // doesn't expose a comment node.
+    if node.child_count() == 0 && !matches!(kind, "comment" | "line_comment" | "block_comment") {
+        if let Ok(txt) = node.utf8_text(source.as_bytes()) {
+            let t = txt.trim_start();
+            if t.starts_with('@') {
+                let start_byte = node.start_byte();
+                let bytes = source.as_bytes();
+                let end = bytes[start_byte..]
+                    .iter()
+                    .position(|&b| b == b'\n')
+                    .map_or(bytes.len(), |p| start_byte + p);
+                comments.push((start_byte, end));
             }
         }
     }
 
     if cursor.goto_first_child() {
-        collect_tokens(cursor, tokens, source);
+        collect_prepass(cursor, source, comments, constants);
         while cursor.goto_next_sibling() {
-            collect_tokens(cursor, tokens, source);
+            collect_prepass(cursor, source, comments, constants);
+        }
+        cursor.goto_parent();
+    }
+}
+
+fn collect_tokens(
+    cursor: &mut tree_sitter::TreeCursor,
+    tokens: &mut Vec<RawToken>,
+    source: &str,
+    constants: &HashSet<String>,
+) {
+    let node = cursor.node();
+    let kind = node.kind();
+
+    // Modifier bit positions (must match legend order: readonly=0, declaration=1)
+    const MOD_READONLY: u32 = 1 << 0;
+    const MOD_DECL: u32 = 1 << 1;
+
+    // Token type IDs (must match SEMANTIC_TOKENS_LEGEND order)
+    // 0:keyword 1:variable 2:function 3:macro 4:parameter 5:number 6:string 7:comment 8:namespace
+    let mut recurse = true;
+    match kind {
+        // Directive marker (e.g. ".equ", ".global") -> keyword.
+        "meta_ident" => {
+            push_token_node(&node, tokens, 0, 0);
+        }
+        // Comments (single-line: extend to EOL; block: as-is).
+        "comment" | "line_comment" | "comment_line" => {
+            push_token_node_to_eol(&node, source, tokens, 7, 0);
+            recurse = false;
+        }
+        "block_comment" | "comment_block" => {
+            push_token_node(&node, tokens, 7, 0);
+            recurse = false;
+        }
+        // Registers -> variable.
+        "reg" | "register" => {
+            push_token_node(&node, tokens, 1, 0);
+            recurse = false;
+        }
+        // Numeric literals -> number.
+        "int" | "float" | "integer" | "number" | "hex_number" | "oct_number" | "bin_number" => {
+            push_token_node(&node, tokens, 5, 0);
+            recurse = false;
+        }
+        // String literals -> string.
+        "string" | "string_literal" => {
+            push_token_node(&node, tokens, 6, 0);
+            recurse = false;
+        }
+        // Instruction: emit only the mnemonic (`word` / `opcode` / `mnemonic`
+        // child) as keyword; recurse into operands so they are classified
+        // individually (registers/numbers/idents).
+        "instruction" => {
+            let mut c = node.walk();
+            if c.goto_first_child() {
+                loop {
+                    let ch = c.node();
+                    if matches!(ch.kind(), "word" | "opcode" | "mnemonic") {
+                        push_token_node(&ch, tokens, 0, 0);
+                        break;
+                    }
+                    if !c.goto_next_sibling() {
+                        break;
+                    }
+                }
+            }
+        }
+        // Identifiers: context-dependent.
+        "ident" | "variable" => {
+            let parent_kind = node.parent().map(|p| p.kind()).unwrap_or("");
+            if parent_kind == "label" {
+                // Label definition: function + declaration.
+                push_token_node(&node, tokens, 2, MOD_DECL);
+            } else if parent_kind == "macro_definition" {
+                push_token_node(&node, tokens, 3, 0);
+            } else {
+                // Check if this ident is the LHS of a .equ/.set inside a meta.
+                let mut is_equ_lhs = false;
+                if let Some(parent) = node.parent() {
+                    if parent.kind() == "meta" {
+                        if let Ok(txt) = parent.utf8_text(source.as_bytes()) {
+                            let trimmed = txt.trim_start();
+                            let is_equ = trimmed.starts_with(".equ")
+                                || trimmed.starts_with(".set")
+                                || trimmed.starts_with(".equiv");
+                            if is_equ {
+                                // First ident child of the meta is the LHS.
+                                let mut c = parent.walk();
+                                if c.goto_first_child() {
+                                    loop {
+                                        let ch = c.node();
+                                        if ch.kind() == "ident" {
+                                            if ch.id() == node.id() {
+                                                is_equ_lhs = true;
+                                            }
+                                            break;
+                                        }
+                                        if !c.goto_next_sibling() {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if is_equ_lhs {
+                    push_token_node(&node, tokens, 1, MOD_READONLY);
+                } else if let Ok(text) = node.utf8_text(source.as_bytes()) {
+                    if constants.contains(text) {
+                        // Reference to a constant defined elsewhere.
+                        push_token_node(&node, tokens, 1, MOD_READONLY);
+                    } else {
+                        // Any other ident reference is treated as a label/function
+                        // reference. This intentionally avoids opcode-based heuristics.
+                        push_token_node(&node, tokens, 2, 0);
+                    }
+                }
+            }
+            recurse = false;
+        }
+        _ => {}
+    }
+
+    if recurse && cursor.goto_first_child() {
+        collect_tokens(cursor, tokens, source, constants);
+        while cursor.goto_next_sibling() {
+            collect_tokens(cursor, tokens, source, constants);
         }
         cursor.goto_parent();
     }
