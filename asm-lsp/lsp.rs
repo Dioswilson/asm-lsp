@@ -41,19 +41,25 @@ use crate::{
 };
 
 pub static SEMANTIC_TOKENS_LEGEND: LazyLock<SemanticTokensLegend> = LazyLock::new(|| {
+    // Note: We stick to standard LSP token types and modifiers.
+    // - function definitions are annotated with the `declaration` modifier.
+    // - constants/equates are annotated with the `readonly` modifier.
     SemanticTokensLegend {
         token_types: vec![
-            SemanticTokenType::KEYWORD,   // Instructions, Directives
-            SemanticTokenType::VARIABLE,  // Registers, Constants
-            SemanticTokenType::FUNCTION,  // Labels
-            SemanticTokenType::MACRO,     // Macros
-            SemanticTokenType::PARAMETER, // Macro parameters
-            SemanticTokenType::NUMBER,    // Numeric literals
-            SemanticTokenType::STRING,    // String literals
-            SemanticTokenType::COMMENT,   // Comments
-            SemanticTokenType::NAMESPACE, // Namespaces
+            SemanticTokenType::KEYWORD,   // 0: Instructions, Directives
+            SemanticTokenType::VARIABLE,  // 1: Registers, Constants
+            SemanticTokenType::FUNCTION,  // 2: Labels (defs/refs)
+            SemanticTokenType::MACRO,     // 3: Macros
+            SemanticTokenType::PARAMETER, // 4: Macro parameters
+            SemanticTokenType::NUMBER,    // 5: Numeric literals
+            SemanticTokenType::STRING,    // 6: String literals
+            SemanticTokenType::COMMENT,   // 7: Comments
+            SemanticTokenType::NAMESPACE, // 8: Namespaces
         ],
-        token_modifiers: vec![SemanticTokenModifier::READONLY],
+        token_modifiers: vec![
+            SemanticTokenModifier::READONLY,   // bit 0
+            SemanticTokenModifier::DECLARATION // bit 1
+        ],
     }
 });
 
@@ -1639,7 +1645,8 @@ pub fn get_semantic_tokens_full(
     let mut tokens = vec![];
     if let Some(tree) = &tree_entry.tree {
         let mut cursor = tree.walk();
-        collect_tokens(&mut cursor, &mut tokens);
+        let source = doc.get_content(None);
+        collect_tokens(&mut cursor, &mut tokens, source);
     }
 
     // Sort tokens by line, then by character
@@ -1689,29 +1696,12 @@ struct RawToken {
     token_modifiers_bitset: u32,
 }
 
-fn collect_tokens(cursor: &mut tree_sitter::TreeCursor, tokens: &mut Vec<RawToken>) {
+fn collect_tokens(cursor: &mut tree_sitter::TreeCursor, tokens: &mut Vec<RawToken>, source: &str) {
     let node = cursor.node();
     let kind = node.kind();
 
-    let token_type = match kind {
-        "opcode" | "directive" | "meta_ident" => Some(0), // keyword
-        "register" => Some(1),                            // variable
-        "ident" => {
-            let parent_kind = node.parent().map(|p| p.kind());
-            match parent_kind {
-                Some("label") => Some(2),            // function
-                Some("macro_definition") => Some(3), // macro
-                _ => None,
-            }
-        }
-        "meta_param" => Some(4), // parameter
-        "integer" | "number" | "constant" => Some(5),    // number
-        "string" => Some(6),     // string
-        "comment" => Some(7),    // comment
-        _ => None,
-    };
-
-    if let Some(token_type) = token_type {
+    // Helper to push a token
+    let mut push_token = |tt: u32, mods: u32| {
         let start = node.start_position();
         let end = node.end_position();
         if start.row == end.row {
@@ -1719,16 +1709,122 @@ fn collect_tokens(cursor: &mut tree_sitter::TreeCursor, tokens: &mut Vec<RawToke
                 line: start.row as u32,
                 start: start.column as u32,
                 length: (end.column - start.column) as u32,
-                token_type,
-                token_modifiers_bitset: 0,
+                token_type: tt,
+                token_modifiers_bitset: mods,
             });
         }
+    };
+
+    // Constants for modifier bit positions (must match legend order)
+    const MOD_READONLY: u32 = 1 << 0;
+    const MOD_DECL: u32 = 1 << 1;
+
+    // Try to classify this node
+    let classified = match kind {
+        // Instructions/opcodes/directives/meta identifiers
+        "opcode" | "directive" | "meta_ident" | "mnemonic" => {
+            push_token(0, 0); // keyword
+            true
+        }
+        // Comments (various grammars)
+        "comment" | "line_comment" | "block_comment" => {
+            push_token(7, 0);
+            true
+        }
+        // Registers (various grammars)
+        "register" | "reg" => {
+            push_token(1, 0); // variable
+            true
+        }
+        // Numbers
+        "integer" | "number" | "constant" | "hex_number" | "oct_number" | "bin_number" => {
+            push_token(5, 0);
+            true
+        }
+        // Strings
+        "string" | "string_literal" => {
+            push_token(6, 0);
+            true
+        }
+        // Identifiers need context
+        "ident" => {
+            let mut handled = false;
+            if let Some(parent) = node.parent() {
+                let pkind = parent.kind();
+                if pkind == "label" {
+                    // Label definition: function + declaration
+                    push_token(2, MOD_DECL);
+                    handled = true;
+                } else if pkind == "macro_definition" {
+                    push_token(3, 0); // macro name
+                    handled = true;
+                } else if pkind == "directive" {
+                    // e.g., .equ/.set NAME, VALUE  => NAME is readonly variable
+                    if let Ok(text) = parent.utf8_text(source.as_bytes()) {
+                        if text.contains(".equ") || text.contains(".set") {
+                            push_token(1, MOD_READONLY);
+                            handled = true;
+                        }
+                    }
+                }
+            }
+
+            if !handled {
+                // Heuristics: function call target if previous named sibling is a call opcode
+                let is_call_target = if let Some(prev) = node.prev_named_sibling() {
+                    if prev.kind() == "opcode" || prev.kind() == "mnemonic" {
+                        if let Ok(op) = prev.utf8_text(source.as_bytes()) {
+                            let op_l = op.trim().to_ascii_lowercase();
+                            matches!(
+                                op_l.as_str(),
+                                "bl" | "blx" | "call" | "jal" | "jsr" | "bsr"
+                            )
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+
+                if is_call_target {
+                    // Function reference (call). No standard "call" modifier in LSP; use plain function.
+                    push_token(2, 0);
+                    handled = true;
+                } else {
+                    // ARM registers often lex as idents; apply a regex heuristic
+                    if let Ok(text) = node.utf8_text(source.as_bytes()) {
+                        let t = text.trim();
+                        let is_arm_reg = {
+                            // r0-r31, x0-x30, w0-w30, sp, lr, pc
+                            let tl = t.to_ascii_lowercase();
+                            (tl.starts_with('r') || tl.starts_with('x') || tl.starts_with('w'))
+                                && tl[1..].chars().take_while(|c| c.is_ascii_digit()).count() > 0
+                                || matches!(tl.as_str(), "sp" | "lr" | "pc")
+                        };
+                        if is_arm_reg {
+                            push_token(1, 0);
+                            handled = true;
+                        }
+                    }
+                }
+            }
+
+            handled
+        }
+        _ => false,
+    };
+
+    if !classified {
+        // no-op
     }
 
     if cursor.goto_first_child() {
-        collect_tokens(cursor, tokens);
+        collect_tokens(cursor, tokens, source);
         while cursor.goto_next_sibling() {
-            collect_tokens(cursor, tokens);
+            collect_tokens(cursor, tokens, source);
         }
         cursor.goto_parent();
     }
