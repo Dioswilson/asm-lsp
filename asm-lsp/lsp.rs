@@ -1649,24 +1649,34 @@ pub fn get_semantic_tokens_full(
         // Pre-pass 1: collect comment ranges (byte ranges). Any other token
         // overlapping a comment range is suppressed.
         let mut comment_ranges: Vec<(usize, usize)> = Vec::new();
-        // Pre-pass 2: collect names defined as constants by `.equ`/`.set`/`equ`
-        // so that references to them can be classified as variable+readonly.
+        // Pre-pass 2: collect semantic names whose references depend on a
+        // declaration elsewhere in the document.
         let mut constants: HashSet<String> = HashSet::new();
+        let mut labels: HashSet<String> = HashSet::new();
+        let mut macros: HashSet<String> = HashSet::new();
         {
             let mut c = tree.walk();
-            collect_prepass(&mut c, source, &mut comment_ranges, &mut constants);
+            collect_prepass(
+                &mut c,
+                source,
+                &mut comment_ranges,
+                &mut constants,
+                &mut labels,
+            );
         }
         // Source-level scan as a backstop: detect line-comment characters that
         // the grammar may not expose as comment nodes (`@`, `;`, `#`, `//`).
         // We intentionally do this even when the grammar emits some comments,
         // because the grammar may miss architecture-specific cases.
         scan_line_comments(source, &mut comment_ranges);
+        scan_macro_definitions(source, &comment_ranges, &mut macros);
 
         // Sort comment ranges for binary search overlap checks
         comment_ranges.sort_by_key(|r| r.0);
 
         let mut cursor = tree.walk();
-        collect_tokens(&mut cursor, &mut tokens, source, &constants);
+        collect_tokens(&mut cursor, &mut tokens, source, &constants, &labels, &macros);
+        scan_number_literals(source, &comment_ranges, &mut tokens);
 
         // Emit a comment token for each detected comment range (if not already
         // covered by a grammar-produced comment token at the same position).
@@ -1882,6 +1892,149 @@ fn scan_line_comments(source: &str, ranges: &mut Vec<(usize, usize)>) {
     let _ = line_start;
 }
 
+fn scan_macro_definitions(source: &str, comments: &[(usize, usize)], macros: &mut HashSet<String>) {
+    let mut line_start = 0usize;
+    for line in source.split_inclusive('\n') {
+        let line_end = line_start + line.trim_end_matches('\n').len();
+        let comment_start = comments
+            .iter()
+            .filter_map(|&(s, e)| {
+                if s < line_end && e > line_start {
+                    Some(s.saturating_sub(line_start))
+                } else {
+                    None
+                }
+            })
+            .min()
+            .unwrap_or(line.len());
+        let code = &line[..comment_start.min(line.len())];
+        let trimmed = code.trim_start();
+        let Some(rest) = trimmed
+            .strip_prefix(".macro")
+            .or_else(|| trimmed.strip_prefix(".MACRO"))
+        else {
+            line_start += line.len();
+            continue;
+        };
+
+        for name in rest
+            .split(|c: char| c.is_whitespace() || c == ',' || c == '(' || c == ')')
+            .filter(|s| !s.is_empty())
+        {
+            macros.insert(name.to_string());
+        }
+        line_start += line.len();
+    }
+}
+
+fn scan_number_literals(source: &str, comments: &[(usize, usize)], tokens: &mut Vec<RawToken>) {
+    let bytes = source.as_bytes();
+    let mut i = 0usize;
+    let mut line = 0u32;
+    let mut col = 0u32;
+    let mut in_string: Option<u8> = None;
+    let is_ident_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+
+    while i < bytes.len() {
+        if is_in_comment(i, i + 1, comments) {
+            i += 1;
+            col += 1;
+            continue;
+        }
+
+        let b = bytes[i];
+        if let Some(q) = in_string {
+            if b == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                col += 2;
+                continue;
+            }
+            if b == q {
+                in_string = None;
+            }
+            if b == b'\n' {
+                line += 1;
+                col = 0;
+            } else {
+                col += 1;
+            }
+            i += 1;
+            continue;
+        }
+
+        match b {
+            b'"' | b'\'' => {
+                in_string = Some(b);
+                i += 1;
+                col += 1;
+            }
+            b'\n' => {
+                i += 1;
+                line += 1;
+                col = 0;
+            }
+            b'0'..=b'9' => {
+                if i > 0 && is_ident_byte(bytes[i - 1]) {
+                    i += 1;
+                    col += 1;
+                    continue;
+                }
+
+                let start = i;
+                let start_col = col;
+
+                if bytes[i] == b'0'
+                    && i + 2 < bytes.len()
+                    && matches!(bytes[i + 1], b'x' | b'X')
+                    && bytes[i + 2].is_ascii_hexdigit()
+                {
+                    i += 2;
+                    col += 2;
+                    while i < bytes.len() && bytes[i].is_ascii_hexdigit() {
+                        i += 1;
+                        col += 1;
+                    }
+                } else if bytes[i] == b'0'
+                    && i + 2 < bytes.len()
+                    && matches!(bytes[i + 1], b'b' | b'B')
+                    && matches!(bytes[i + 2], b'0' | b'1')
+                {
+                    i += 2;
+                    col += 2;
+                    while i < bytes.len() && matches!(bytes[i], b'0' | b'1') {
+                        i += 1;
+                        col += 1;
+                    }
+                } else {
+                    i += 1;
+                    col += 1;
+                    while i < bytes.len() && bytes[i].is_ascii_digit() {
+                        i += 1;
+                        col += 1;
+                    }
+                }
+
+                if i < bytes.len() && is_ident_byte(bytes[i]) {
+                    continue;
+                }
+                tokens.push(RawToken {
+                    line,
+                    start: start_col,
+                    length: col - start_col,
+                    token_type: 5,
+                    token_modifiers_bitset: 0,
+                    start_byte: start,
+                    end_byte: i,
+                });
+            }
+            _ => {
+                i += 1;
+                col += 1;
+            }
+        }
+    }
+}
+
 /// Returns true if the [start, end) byte range overlaps any comment range.
 fn is_in_comment(start: usize, end: usize, ranges: &[(usize, usize)]) -> bool {
     // ranges sorted by .0; linear scan acceptable, ranges typically small
@@ -1896,13 +2049,13 @@ fn is_in_comment(start: usize, end: usize, ranges: &[(usize, usize)]) -> bool {
     false
 }
 
-/// Walk the tree once to collect comment ranges and constant names defined by
-/// `.equ` / `.set` directives.
+/// Walk the tree once to collect comment ranges and declaration-backed names.
 fn collect_prepass(
     cursor: &mut tree_sitter::TreeCursor,
     source: &str,
     comments: &mut Vec<(usize, usize)>,
     constants: &mut HashSet<String>,
+    labels: &mut HashSet<String>,
 ) {
     let node = cursor.node();
     let kind = node.kind();
@@ -1923,6 +2076,23 @@ fn collect_prepass(
                 rel.max(node.end_byte())
             };
             comments.push((start_byte, end_byte));
+        }
+        "label" => {
+            let mut c = node.walk();
+            if c.goto_first_child() {
+                loop {
+                    let ch = c.node();
+                    if ch.kind() == "ident" {
+                        if let Ok(name) = ch.utf8_text(source.as_bytes()) {
+                            labels.insert(name.to_string());
+                        }
+                        break;
+                    }
+                    if !c.goto_next_sibling() {
+                        break;
+                    }
+                }
+            }
         }
         // Detect `.equ NAME, value` / `.set NAME, value` directive forms.
         "meta" => {
@@ -1975,9 +2145,9 @@ fn collect_prepass(
     }
 
     if cursor.goto_first_child() {
-        collect_prepass(cursor, source, comments, constants);
+        collect_prepass(cursor, source, comments, constants, labels);
         while cursor.goto_next_sibling() {
-            collect_prepass(cursor, source, comments, constants);
+            collect_prepass(cursor, source, comments, constants, labels);
         }
         cursor.goto_parent();
     }
@@ -1988,6 +2158,8 @@ fn collect_tokens(
     tokens: &mut Vec<RawToken>,
     source: &str,
     constants: &HashSet<String>,
+    labels: &HashSet<String>,
+    macros: &HashSet<String>,
 ) {
     let node = cursor.node();
     let kind = node.kind();
@@ -2092,22 +2264,34 @@ fn collect_tokens(
                     if constants.contains(text) {
                         // Reference to a constant defined elsewhere.
                         push_token_node(&node, tokens, 1, MOD_READONLY);
-                    } else {
-                        // Any other ident reference is treated as a label/function
-                        // reference. This intentionally avoids opcode-based heuristics.
+                    } else if macros.contains(text) {
+                        push_token_node(&node, tokens, 3, 0);
+                    } else if labels.contains(text) {
                         push_token_node(&node, tokens, 2, 0);
+                    } else {
+                        push_token_node(&node, tokens, 1, 0);
                     }
                 }
             }
             recurse = false;
         }
+        "word" => {
+            let parent_kind = node.parent().map(|p| p.kind()).unwrap_or("");
+            if parent_kind != "instruction"
+                && let Ok(text) = node.utf8_text(source.as_bytes())
+                && macros.contains(text)
+            {
+                push_token_node(&node, tokens, 3, 0);
+                recurse = false;
+            }
+        }
         _ => {}
     }
 
     if recurse && cursor.goto_first_child() {
-        collect_tokens(cursor, tokens, source, constants);
+        collect_tokens(cursor, tokens, source, constants, labels, macros);
         while cursor.goto_next_sibling() {
-            collect_tokens(cursor, tokens, source, constants);
+            collect_tokens(cursor, tokens, source, constants, labels, macros);
         }
         cursor.goto_parent();
     }

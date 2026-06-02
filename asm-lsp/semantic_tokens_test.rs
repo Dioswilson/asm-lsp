@@ -8,6 +8,7 @@ mod tests {
     const TT_KEYWORD: u32 = 0;
     const TT_VARIABLE: u32 = 1;
     const TT_FUNCTION: u32 = 2;
+    const TT_MACRO: u32 = 3;
     const TT_NUMBER: u32 = 5;
     const TT_STRING: u32 = 6;
     const TT_COMMENT: u32 = 7;
@@ -112,14 +113,31 @@ mod tests {
     }
 
     #[test]
-    fn label_reference_is_plain_function_no_opcode_heuristic() {
-        // Reference appears after a non-branch instruction. With the new logic,
-        // any non-declaration ident is treated as a function reference.
-        let src = "main:\n    mov %rax, other\n";
+    fn known_label_reference_is_plain_function() {
+        let src = "main:\n    bl main\n";
+        let toks = run(src);
+        let refs: Vec<&Decoded> = toks
+            .iter()
+            .filter(|t| t.text == "main" && t.mods == 0)
+            .collect();
+        assert_eq!(refs.len(), 1, "expected one main reference: {toks:?}");
+        assert_eq!(refs[0].tt, TT_FUNCTION);
+    }
+
+    #[test]
+    fn generic_identifier_is_not_function() {
+        let src = "    mov %rax, other\n";
         let toks = run(src);
         let other = find(&toks, "other").expect("other ref");
-        assert_eq!(other.tt, TT_FUNCTION);
-        assert_eq!(other.mods, 0, "reference must not have declaration mod");
+        assert_eq!(other.tt, TT_VARIABLE);
+    }
+
+    #[test]
+    fn register_wrapped_in_ident_is_variable() {
+        let src = "    adr x0, main\n";
+        let toks = run(src);
+        let x0 = find(&toks, "x0").expect("x0 register");
+        assert_eq!(x0.tt, TT_VARIABLE);
     }
 
     #[test]
@@ -143,10 +161,19 @@ mod tests {
         let src = ".extern printf\n";
         let toks = run(src);
         let p = find(&toks, "printf").expect("printf ident");
+        assert_eq!(p.tt, TT_VARIABLE, ".extern arg must not be function");
         assert!(
             p.mods & MOD_READONLY == 0,
             ".extern arg must not be readonly: {p:?}"
         );
+    }
+
+    #[test]
+    fn macro_parameter_is_macro() {
+        let src = ".macro PRINT value\n";
+        let toks = run(src);
+        let value = find(&toks, "value").expect("macro parameter");
+        assert_eq!(value.tt, TT_MACRO);
     }
 
     #[test]
@@ -216,10 +243,10 @@ main:
 
         // .extern marker is keyword
         assert_eq!(find(&toks, ".extern").unwrap().tt, TT_KEYWORD);
-        // printf is a label reference -> function (no readonly modifier)
+        // printf is an unresolved external/generic identifier, not a label.
         let printf_refs: Vec<&Decoded> = toks.iter().filter(|t| t.text == "printf").collect();
         for p in &printf_refs {
-            assert_eq!(p.tt, TT_FUNCTION, "printf should be function ref");
+            assert_eq!(p.tt, TT_VARIABLE, "printf should be generic variable");
             assert!(p.mods & MOD_READONLY == 0);
         }
         // .equ marker is keyword, CONST is variable + readonly
