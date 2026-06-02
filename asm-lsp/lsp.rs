@@ -24,9 +24,10 @@ use lsp_types::{
     CompletionItem, CompletionItemKind, CompletionList, CompletionParams, CompletionTriggerKind,
     Diagnostic, DocumentSymbol, DocumentSymbolParams, Documentation, GotoDefinitionParams,
     GotoDefinitionResponse, Hover, HoverContents, HoverParams, InitializeParams, Location,
-    MarkupContent, MarkupKind, MessageType, Position, Range, ReferenceParams, SignatureHelp,
-    SignatureHelpParams, SignatureInformation, SymbolKind, TextDocumentContentChangeEvent,
-    TextDocumentPositionParams, Uri,
+    MarkupContent, MarkupKind, MessageType, Position, Range, ReferenceParams, SemanticToken,
+    SemanticTokenModifier, SemanticTokens, SemanticTokensLegend, SemanticTokensResult,
+    SemanticTokenType, SignatureHelp, SignatureHelpParams, SignatureInformation, SymbolKind,
+    TextDocumentContentChangeEvent, TextDocumentPositionParams, Uri,
 };
 use regex::Regex;
 use symbolic::common::{Language, Name, NameMangling};
@@ -38,6 +39,23 @@ use crate::{
     Directive, DocumentStore, Hoverable, Instruction, NameToInstructionMap, RootConfig,
     ServerStore, TreeEntry, types::Column, ustr,
 };
+
+pub static SEMANTIC_TOKENS_LEGEND: LazyLock<SemanticTokensLegend> = LazyLock::new(|| {
+    SemanticTokensLegend {
+        token_types: vec![
+            SemanticTokenType::KEYWORD,   // Instructions, Directives
+            SemanticTokenType::VARIABLE,  // Registers, Constants
+            SemanticTokenType::FUNCTION,  // Labels
+            SemanticTokenType::MACRO,     // Macros
+            SemanticTokenType::PARAMETER, // Macro parameters
+            SemanticTokenType::NUMBER,    // Numeric literals
+            SemanticTokenType::STRING,    // String literals
+            SemanticTokenType::COMMENT,   // Comments
+            SemanticTokenType::NAMESPACE, // Namespaces
+        ],
+        token_modifiers: vec![SemanticTokenModifier::READONLY],
+    }
+});
 
 /// Prints information about the server
 ///
@@ -1607,6 +1625,113 @@ pub fn get_document_symbols(
         }
         res
     })
+}
+
+/// Get semantic tokens for the document.
+pub fn get_semantic_tokens_full(
+    doc: &FullTextDocument,
+    tree_entry: &mut TreeEntry,
+) -> SemanticTokensResult {
+    tree_entry.tree = tree_entry
+        .parser
+        .parse(doc.get_content(None), tree_entry.tree.as_ref());
+
+    let mut tokens = vec![];
+    if let Some(tree) = &tree_entry.tree {
+        let mut cursor = tree.walk();
+        collect_tokens(&mut cursor, &mut tokens);
+    }
+
+    // Sort tokens by line, then by character
+    tokens.sort_by(|a, b| {
+        if a.line != b.line {
+            a.line.cmp(&b.line)
+        } else {
+            a.start.cmp(&b.start)
+        }
+    });
+
+    let mut lsp_tokens = vec![];
+    let mut last_line = 0;
+    let mut last_start = 0;
+
+    for token in tokens {
+        let delta_line = token.line - last_line;
+        let delta_start = if delta_line == 0 {
+            token.start - last_start
+        } else {
+            token.start
+        };
+
+        lsp_tokens.push(SemanticToken {
+            delta_line,
+            delta_start,
+            length: token.length,
+            token_type: token.token_type,
+            token_modifiers_bitset: token.token_modifiers_bitset,
+        });
+
+        last_line = token.line;
+        last_start = token.start;
+    }
+
+    SemanticTokensResult::Tokens(SemanticTokens {
+        result_id: None,
+        data: lsp_tokens,
+    })
+}
+
+struct RawToken {
+    line: u32,
+    start: u32,
+    length: u32,
+    token_type: u32,
+    token_modifiers_bitset: u32,
+}
+
+fn collect_tokens(cursor: &mut tree_sitter::TreeCursor, tokens: &mut Vec<RawToken>) {
+    let node = cursor.node();
+    let kind = node.kind();
+
+    let token_type = match kind {
+        "opcode" | "directive" | "meta_ident" => Some(0), // keyword
+        "register" => Some(1),                            // variable
+        "ident" => {
+            let parent_kind = node.parent().map(|p| p.kind());
+            match parent_kind {
+                Some("label") => Some(2),            // function
+                Some("macro_definition") => Some(3), // macro
+                _ => None,
+            }
+        }
+        "meta_param" => Some(4), // parameter
+        "integer" | "number" | "constant" => Some(5),    // number
+        "string" => Some(6),     // string
+        "comment" => Some(7),    // comment
+        _ => None,
+    };
+
+    if let Some(token_type) = token_type {
+        let start = node.start_position();
+        let end = node.end_position();
+        if start.row == end.row {
+            tokens.push(RawToken {
+                line: start.row as u32,
+                start: start.column as u32,
+                length: (end.column - start.column) as u32,
+                token_type,
+                token_modifiers_bitset: 0,
+            });
+        }
+    }
+
+    if cursor.goto_first_child() {
+        collect_tokens(cursor, tokens);
+        while cursor.goto_next_sibling() {
+            collect_tokens(cursor, tokens);
+        }
+        cursor.goto_parent();
+    }
 }
 
 /// Produces a signature help response if the appropriate instruction forms can

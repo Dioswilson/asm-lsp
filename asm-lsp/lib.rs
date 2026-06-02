@@ -1,6 +1,7 @@
 pub mod config_builder;
 pub mod handle;
-mod lsp;
+pub mod lsp;
+mod semantic_tokens_test;
 pub mod parser;
 mod test;
 pub mod types;

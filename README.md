@@ -5,7 +5,7 @@
 
 ## Goal
 
-Provide hovering, autocompletion, signature help, go to definition, and view
+Provide hovering, autocompletion, signature help, go to definition, semantic tokens, and view
 references for assembly files written in the GAS/NASM or GO assembly flavors. It
 supports assembly files for the x86, x86_64, ARM, RISCV, z80, AVR, and 6502 instruction
 sets. Supported assemblers include the Gas, Go, Masm, Nasm, ca65, AVR, and FASM

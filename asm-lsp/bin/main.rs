@@ -154,6 +154,18 @@ pub fn run_lsp() -> Result<()> {
         document_symbol_provider: Some(OneOf::Left(true)),
         references_provider,
         diagnostic_provider,
+        semantic_tokens_provider: Some(
+            lsp_types::SemanticTokensServerCapabilities::SemanticTokensOptions(
+                lsp_types::SemanticTokensOptions {
+                    work_done_progress_options: lsp_types::WorkDoneProgressOptions {
+                        work_done_progress: None,
+                    },
+                    legend: asm_lsp::lsp::SEMANTIC_TOKENS_LEGEND.clone(),
+                    range: Some(false),
+                    full: Some(lsp_types::SemanticTokensFullOptions::Bool(true)),
+                },
+            ),
+        ),
         ..ServerCapabilities::default()
     };
     let server_capabilities = serde_json::to_value(capabilities).unwrap();

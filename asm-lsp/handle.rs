@@ -5,14 +5,15 @@ use lsp_server::{Connection, Message, Notification, Request, RequestId, Response
 use lsp_types::{
     CompletionParams, Diagnostic, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
     DidOpenTextDocumentParams, DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams,
-    HoverParams, PublishDiagnosticsParams, ReferenceParams, SignatureHelpParams, Uri,
+    HoverParams, PublishDiagnosticsParams, ReferenceParams, SemanticTokensParams,
+    SignatureHelpParams, Uri,
     notification::{
         DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument, DidSaveTextDocument,
         Notification as _, PublishDiagnostics,
     },
     request::{
         Completion, DocumentDiagnosticRequest, DocumentSymbolRequest, GotoDefinition, HoverRequest,
-        References, Request as RequestMessage, SignatureHelpRequest,
+        References, Request as RequestMessage, SemanticTokensFullRequest, SignatureHelpRequest,
     },
 };
 use tree_sitter::Parser;
@@ -21,8 +22,8 @@ use crate::{
     CompletionItems, Config, ConfigOptions, DocumentStore, NameToInstructionMap, RootConfig,
     ServerStore, TreeEntry, UriConversion, apply_compile_cmd, get_comp_resp,
     get_compile_cmd_for_req, get_default_compile_cmd, get_document_symbols, get_goto_def_resp,
-    get_hover_resp, get_ref_resp, get_sig_help_resp, get_word_from_pos_params, process_uri,
-    send_empty_resp, text_doc_change_to_ts_edit,
+    get_hover_resp, get_ref_resp, get_semantic_tokens_full, get_sig_help_resp,
+    get_word_from_pos_params, process_uri, send_empty_resp, text_doc_change_to_ts_edit,
 };
 
 // A bug in Neovim can cause client->server RPC messages to be corrupted. If this
@@ -139,6 +140,15 @@ pub fn handle_request(
             info!(
                 "{} request serviced in {}ms",
                 References::METHOD,
+                start.elapsed().as_millis()
+            );
+        }
+        SemanticTokensFullRequest::METHOD => {
+            let (id, params) = cast_req!(req, SemanticTokensFullRequest);
+            handle_semantic_tokens_full_request(connection, id, &params, doc_store)?;
+            info!(
+                "{} request serviced in {}ms",
+                SemanticTokensFullRequest::METHOD,
                 start.elapsed().as_millis()
             );
         }
@@ -454,6 +464,39 @@ pub fn handle_signature_help_request(
         )
     {
         let result = serde_json::to_value(sig_resp).unwrap();
+        let result = Response {
+            id,
+            result: Some(result),
+            error: None,
+        };
+        return Ok(connection.sender.send(Message::Response(result))?);
+    }
+
+    send_empty_resp(connection, id)
+}
+
+/// Handles semantic tokens full requests
+///
+/// # Errors
+///
+/// Returns 'Err' if the response fails to send via `connection`
+///
+/// # Panics
+///
+/// Panics if JSON encoding of a response fails
+pub fn handle_semantic_tokens_full_request(
+    connection: &Connection,
+    id: RequestId,
+    params: &SemanticTokensParams,
+    doc_store: &mut DocumentStore,
+) -> Result<()> {
+    let uri = &params.text_document.uri;
+    if let Some(doc) = doc_store.text_store.get_document(uri)
+        && let Some(tree_entry) = doc_store.tree_store.get_mut(uri)
+    {
+        let semantic_tokens_resp = get_semantic_tokens_full(doc, tree_entry);
+        let result = serde_json::to_value(&semantic_tokens_resp).unwrap();
+
         let result = Response {
             id,
             result: Some(result),
