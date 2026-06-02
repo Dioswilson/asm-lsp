@@ -1722,12 +1722,12 @@ fn collect_tokens(cursor: &mut tree_sitter::TreeCursor, tokens: &mut Vec<RawToke
     // Try to classify this node
     let classified = match kind {
         // Instructions/opcodes/directives/meta identifiers
-        "opcode" | "directive" | "meta_ident" | "mnemonic" => {
+        "opcode" | "directive" | "meta_ident" | "mnemonic" | "instruction" => {
             push_token(0, 0); // keyword
             true
         }
         // Comments (various grammars)
-        "comment" | "line_comment" | "block_comment" => {
+        "comment" | "line_comment" | "block_comment" | "comment_line" | "comment_block" => {
             push_token(7, 0);
             true
         }
@@ -1746,8 +1746,8 @@ fn collect_tokens(cursor: &mut tree_sitter::TreeCursor, tokens: &mut Vec<RawToke
             push_token(6, 0);
             true
         }
-        // Identifiers need context
-        "ident" => {
+        // Identifiers and generic variables need context
+        "ident" | "variable" => {
             let mut handled = false;
             if let Some(parent) = node.parent() {
                 let pkind = parent.kind();
@@ -1794,15 +1794,17 @@ fn collect_tokens(cursor: &mut tree_sitter::TreeCursor, tokens: &mut Vec<RawToke
                     push_token(2, 0);
                     handled = true;
                 } else {
-                    // ARM registers often lex as idents; apply a regex heuristic
+                    // ARM registers often lex as idents; apply a regex heuristic, but only when
+                    // not immediately following a call-like opcode (handled above) and not part of a label/dir
                     if let Ok(text) = node.utf8_text(source.as_bytes()) {
                         let t = text.trim();
                         let is_arm_reg = {
                             // r0-r31, x0-x30, w0-w30, sp, lr, pc
                             let tl = t.to_ascii_lowercase();
-                            (tl.starts_with('r') || tl.starts_with('x') || tl.starts_with('w'))
-                                && tl[1..].chars().take_while(|c| c.is_ascii_digit()).count() > 0
-                                || matches!(tl.as_str(), "sp" | "lr" | "pc")
+                            let is_rxw = (tl.starts_with('r') || tl.starts_with('x') || tl.starts_with('w'))
+                                && tl.len() > 1
+                                && tl[1..].chars().all(|c| c.is_ascii_digit());
+                            is_rxw || matches!(tl.as_str(), "sp" | "lr" | "pc")
                         };
                         if is_arm_reg {
                             push_token(1, 0);
