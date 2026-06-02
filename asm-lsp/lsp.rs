@@ -1696,24 +1696,44 @@ struct RawToken {
     token_modifiers_bitset: u32,
 }
 
+fn push_token_node(node: &tree_sitter::Node, tokens: &mut Vec<RawToken>, tt: u32, mods: u32) {
+    let start = node.start_position();
+    let end = node.end_position();
+    if start.row == end.row {
+        tokens.push(RawToken {
+            line: start.row as u32,
+            start: start.column as u32,
+            length: (end.column - start.column) as u32,
+            token_type: tt,
+            token_modifiers_bitset: mods,
+        });
+    }
+}
+
+fn push_token_node_to_eol(
+    node: &tree_sitter::Node,
+    source: &str,
+    tokens: &mut Vec<RawToken>,
+    tt: u32,
+    mods: u32,
+) {
+    let start = node.start_position();
+    let start_byte = node.start_byte();
+    let slice = &source.as_bytes()[start_byte..];
+    let rel_end = slice.iter().position(|&b| b == b'\n').unwrap_or(slice.len());
+    let end_col = start.column as usize + rel_end;
+    tokens.push(RawToken {
+        line: start.row as u32,
+        start: start.column as u32,
+        length: end_col.saturating_sub(start.column as usize) as u32,
+        token_type: tt,
+        token_modifiers_bitset: mods,
+    });
+}
+
 fn collect_tokens(cursor: &mut tree_sitter::TreeCursor, tokens: &mut Vec<RawToken>, source: &str) {
     let node = cursor.node();
     let kind = node.kind();
-
-    // Helper to push a token
-    let mut push_token = |tt: u32, mods: u32| {
-        let start = node.start_position();
-        let end = node.end_position();
-        if start.row == end.row {
-            tokens.push(RawToken {
-                line: start.row as u32,
-                start: start.column as u32,
-                length: (end.column - start.column) as u32,
-                token_type: tt,
-                token_modifiers_bitset: mods,
-            });
-        }
-    };
 
     // Constants for modifier bit positions (must match legend order)
     const MOD_READONLY: u32 = 1 << 0;
@@ -1723,27 +1743,33 @@ fn collect_tokens(cursor: &mut tree_sitter::TreeCursor, tokens: &mut Vec<RawToke
     let classified = match kind {
         // Instructions/opcodes/directives/meta identifiers
         "opcode" | "directive" | "meta_ident" | "mnemonic" | "instruction" => {
-            push_token(0, 0); // keyword
+            push_token_node(&node, tokens, 0, 0); // keyword
             true
         }
         // Comments (various grammars)
-        "comment" | "line_comment" | "block_comment" | "comment_line" | "comment_block" => {
-            push_token(7, 0);
+        // For safety, extend to end-of-line so the whole trailing comment is highlighted.
+        "comment" | "line_comment" | "comment_line" => {
+            push_token_node_to_eol(&node, source, tokens, 7, 0);
+            true
+        }
+        // Block comments typically span multiple lines and nodes already cover them
+        "block_comment" | "comment_block" => {
+            push_token_node(&node, tokens, 7, 0);
             true
         }
         // Registers (various grammars)
         "register" | "reg" => {
-            push_token(1, 0); // variable
+            push_token_node(&node, tokens, 1, 0); // variable
             true
         }
         // Numbers
         "integer" | "number" | "constant" | "hex_number" | "oct_number" | "bin_number" => {
-            push_token(5, 0);
+            push_token_node(&node, tokens, 5, 0);
             true
         }
         // Strings
         "string" | "string_literal" => {
-            push_token(6, 0);
+            push_token_node(&node, tokens, 6, 0);
             true
         }
         // Identifiers and generic variables need context
@@ -1753,28 +1779,38 @@ fn collect_tokens(cursor: &mut tree_sitter::TreeCursor, tokens: &mut Vec<RawToke
                 let pkind = parent.kind();
                 if pkind == "label" {
                     // Label definition: function + declaration
-                    push_token(2, MOD_DECL);
+                    push_token_node(&node, tokens, 2, MOD_DECL);
                     handled = true;
                 } else if pkind == "macro_definition" {
-                    push_token(3, 0); // macro name
+                    push_token_node(&node, tokens, 3, 0); // macro name
                     handled = true;
                 } else {
                     // e.g., .equ/.set NAME, VALUE  => NAME is readonly variable
-                    // Look at parent and up to 2 ancestors for a directive containing .equ/.set
+                    // Restrict detection to directive ancestors and ensure this ident
+                    // appears before the first ',' or '=' in the directive text.
                     let mut anc = Some(parent);
-                    for _ in 0..3 {
+                    for _ in 0..2 {
                         if let Some(a) = anc {
-                            if let Ok(txt) = a.utf8_text(source.as_bytes()) {
-                                if txt.contains(".equ") || txt.contains(".set") {
-                                    push_token(1, MOD_READONLY);
-                                    handled = true;
-                                    break;
+                            if a.kind() == "directive" {
+                                if let Ok(txt) = a.utf8_text(source.as_bytes()) {
+                                    let t = txt.trim_start();
+                                    if t.starts_with(".equ") || t.starts_with(".set") {
+                                        // Compute this ident's offset inside the directive text
+                                        let base = a.start_byte();
+                                        let id_off = node.start_byte().saturating_sub(base);
+                                        // Find first ',' or '=' in directive
+                                        let bytes = txt.as_bytes();
+                                        let sep = bytes.iter().position(|&b| b == b',' || b == b'=').unwrap_or(bytes.len());
+                                        if id_off <= sep { // LHS of directive
+                                            push_token_node(&node, tokens, 1, MOD_READONLY);
+                                            handled = true;
+                                        }
+                                    }
                                 }
+                                break;
                             }
                             anc = a.parent();
-                        } else {
-                            break;
-                        }
+                        } else { break; }
                     }
                 }
             }
@@ -1814,7 +1850,7 @@ fn collect_tokens(cursor: &mut tree_sitter::TreeCursor, tokens: &mut Vec<RawToke
 
                 if is_call_target {
                     // Function reference (call). No standard "call" modifier in LSP; use plain function.
-                    push_token(2, 0);
+                    push_token_node(&node, tokens, 2, 0);
                     handled = true;
                 } else {
                     // ARM registers often lex as idents; apply a regex heuristic, but only when
@@ -1830,7 +1866,7 @@ fn collect_tokens(cursor: &mut tree_sitter::TreeCursor, tokens: &mut Vec<RawToke
                             is_rxw || matches!(tl.as_str(), "sp" | "lr" | "pc")
                         };
                         if is_arm_reg {
-                            push_token(1, 0);
+                            push_token_node(&node, tokens, 1, 0);
                             handled = true;
                         }
                     }
@@ -1843,12 +1879,12 @@ fn collect_tokens(cursor: &mut tree_sitter::TreeCursor, tokens: &mut Vec<RawToke
     };
 
     if !classified {
-        // Fallback: classify leaf nodes that look like comments based on text prefix
+        // Fallback: classify leaf nodes that look like comments for ARM-style '@' comments only
         if node.child_count() == 0 {
             if let Ok(txt) = node.utf8_text(source.as_bytes()) {
                 let t = txt.trim_start();
-                if t.starts_with(';') || t.starts_with('#') || t.starts_with('@') {
-                    push_token(7, 0);
+                if t.starts_with('@') {
+                    push_token_node_to_eol(&node, source, tokens, 7, 0);
                 }
             }
         }
