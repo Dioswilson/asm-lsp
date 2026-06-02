@@ -1758,36 +1758,59 @@ fn collect_tokens(cursor: &mut tree_sitter::TreeCursor, tokens: &mut Vec<RawToke
                 } else if pkind == "macro_definition" {
                     push_token(3, 0); // macro name
                     handled = true;
-                } else if pkind == "directive" {
+                } else {
                     // e.g., .equ/.set NAME, VALUE  => NAME is readonly variable
-                    if let Ok(text) = parent.utf8_text(source.as_bytes()) {
-                        if text.contains(".equ") || text.contains(".set") {
-                            push_token(1, MOD_READONLY);
-                            handled = true;
+                    // Look at parent and up to 2 ancestors for a directive containing .equ/.set
+                    let mut anc = Some(parent);
+                    for _ in 0..3 {
+                        if let Some(a) = anc {
+                            if let Ok(txt) = a.utf8_text(source.as_bytes()) {
+                                if txt.contains(".equ") || txt.contains(".set") {
+                                    push_token(1, MOD_READONLY);
+                                    handled = true;
+                                    break;
+                                }
+                            }
+                            anc = a.parent();
+                        } else {
+                            break;
                         }
                     }
                 }
             }
 
             if !handled {
-                // Heuristics: function call target if previous named sibling is a call opcode
-                let is_call_target = if let Some(prev) = node.prev_named_sibling() {
-                    if prev.kind() == "opcode" || prev.kind() == "mnemonic" {
-                        if let Ok(op) = prev.utf8_text(source.as_bytes()) {
-                            let op_l = op.trim().to_ascii_lowercase();
-                            matches!(
-                                op_l.as_str(),
-                                "bl" | "blx" | "call" | "jal" | "jsr" | "bsr"
-                            )
-                        } else {
-                            false
+                // Heuristics: function/label reference if inside an instruction whose mnemonic is call/branch-like
+                let mut is_call_target = false;
+                // Search upward for an ancestor instruction node
+                let mut anc = node.parent();
+                while let Some(a) = anc {
+                    let ak = a.kind();
+                    if ak == "instruction" {
+                        // Find the mnemonic/opcode child
+                        let mut c = a.walk();
+                        if c.goto_first_child() {
+                            loop {
+                                let ch = c.node();
+                                if ch.kind() == "opcode" || ch.kind() == "mnemonic" {
+                                    if let Ok(op) = ch.utf8_text(source.as_bytes()) {
+                                        let op_l = op.trim().to_ascii_lowercase();
+                                        if matches!(
+                                            op_l.as_str(),
+                                            "bl" | "blx" | "call" | "jal" | "jsr" | "bsr" | "b"
+                                        ) || (op_l.starts_with('b') && op_l.len() > 1) {
+                                            is_call_target = true;
+                                        }
+                                    }
+                                    break;
+                                }
+                                if !c.goto_next_sibling() { break; }
+                            }
                         }
-                    } else {
-                        false
+                        break;
                     }
-                } else {
-                    false
-                };
+                    anc = a.parent();
+                }
 
                 if is_call_target {
                     // Function reference (call). No standard "call" modifier in LSP; use plain function.
@@ -1820,7 +1843,15 @@ fn collect_tokens(cursor: &mut tree_sitter::TreeCursor, tokens: &mut Vec<RawToke
     };
 
     if !classified {
-        // no-op
+        // Fallback: classify leaf nodes that look like comments based on text prefix
+        if node.child_count() == 0 {
+            if let Ok(txt) = node.utf8_text(source.as_bytes()) {
+                let t = txt.trim_start();
+                if t.starts_with(';') || t.starts_with('#') || t.starts_with('@') {
+                    push_token(7, 0);
+                }
+            }
+        }
     }
 
     if cursor.goto_first_child() {
