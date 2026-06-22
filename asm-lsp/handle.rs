@@ -145,7 +145,7 @@ pub fn handle_request(
         }
         SemanticTokensFullRequest::METHOD => {
             let (id, params) = cast_req!(req, SemanticTokensFullRequest);
-            handle_semantic_tokens_full_request(connection, id, &params, doc_store)?;
+            handle_semantic_tokens_full_request(connection, id, &params, doc_store, store)?;
             info!(
                 "{} request serviced in {}ms",
                 SemanticTokensFullRequest::METHOD,
@@ -489,12 +489,14 @@ pub fn handle_semantic_tokens_full_request(
     id: RequestId,
     params: &SemanticTokensParams,
     doc_store: &mut DocumentStore,
+    store: &ServerStore,
 ) -> Result<()> {
     let uri = &params.text_document.uri;
     if let Some(doc) = doc_store.text_store.get_document(uri)
         && let Some(tree_entry) = doc_store.tree_store.get_mut(uri)
     {
-        let semantic_tokens_resp = get_semantic_tokens_full(doc, tree_entry);
+        let isa = crate::IsaNameSets::from_store(store);
+        let semantic_tokens_resp = get_semantic_tokens_full(doc, tree_entry, Some(&isa));
         let result = serde_json::to_value(&semantic_tokens_resp).unwrap();
 
         let result = Response {

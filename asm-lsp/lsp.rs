@@ -1633,14 +1633,49 @@ pub fn get_document_symbols(
     })
 }
 
+/// Lowercase name sets used to ISA-aware classify identifiers/words that the
+/// shared tree-sitter-asm grammar does not tag as `reg`/`opcode`.
+#[derive(Default, Debug, Clone)]
+pub struct IsaNameSets {
+    pub instructions: HashSet<String>,
+    pub registers: HashSet<String>,
+    pub directives: HashSet<String>,
+}
+
+impl IsaNameSets {
+    /// Build the lookup sets from a populated [`ServerStore`].
+    /// All entries are lowercased for case-insensitive matching.
+    #[must_use]
+    pub fn from_store(store: &ServerStore) -> Self {
+        let mut s = Self::default();
+        for ((_, name), _) in &store.names_to_info.instructions {
+            s.instructions.insert(name.to_ascii_lowercase());
+        }
+        for ((_, name), _) in &store.names_to_info.registers {
+            s.registers.insert(name.to_ascii_lowercase());
+            // RISC-V/MIPS registers are often referenced with a `$` or `%` prefix
+            // in source code; store the bare name only — the caller strips
+            // prefixes before lookup.
+        }
+        for ((_, name), _) in &store.names_to_info.directives {
+            s.directives.insert(name.to_ascii_lowercase());
+        }
+        s
+    }
+}
+
 /// Get semantic tokens for the document.
 pub fn get_semantic_tokens_full(
     doc: &FullTextDocument,
     tree_entry: &mut TreeEntry,
+    isa: Option<&IsaNameSets>,
 ) -> SemanticTokensResult {
     tree_entry.tree = tree_entry
         .parser
         .parse(doc.get_content(None), tree_entry.tree.as_ref());
+
+    let empty_isa = IsaNameSets::default();
+    let isa = isa.unwrap_or(&empty_isa);
 
     let mut tokens = vec![];
     if let Some(tree) = &tree_entry.tree {
@@ -1675,7 +1710,15 @@ pub fn get_semantic_tokens_full(
         comment_ranges.sort_by_key(|r| r.0);
 
         let mut cursor = tree.walk();
-        collect_tokens(&mut cursor, &mut tokens, source, &constants, &labels, &macros);
+        collect_tokens(
+            &mut cursor,
+            &mut tokens,
+            source,
+            &constants,
+            &labels,
+            &macros,
+            isa,
+        );
         scan_number_literals(source, &comment_ranges, &mut tokens);
 
         // Emit a comment token for each detected comment range (if not already
@@ -2153,6 +2196,15 @@ fn collect_prepass(
     }
 }
 
+/// Strip common register-prefix characters used by various assemblers so the
+/// remainder can be matched against the ISA register name set.
+fn strip_reg_prefix(s: &str) -> &str {
+    s.strip_prefix('%')
+        .or_else(|| s.strip_prefix('$'))
+        .or_else(|| s.strip_prefix('#'))
+        .unwrap_or(s)
+}
+
 fn collect_tokens(
     cursor: &mut tree_sitter::TreeCursor,
     tokens: &mut Vec<RawToken>,
@@ -2160,6 +2212,7 @@ fn collect_tokens(
     constants: &HashSet<String>,
     labels: &HashSet<String>,
     macros: &HashSet<String>,
+    isa: &IsaNameSets,
 ) {
     let node = cursor.node();
     let kind = node.kind();
@@ -2261,11 +2314,20 @@ fn collect_tokens(
                 if is_equ_lhs {
                     push_token_node(&node, tokens, 1, MOD_READONLY);
                 } else if let Ok(text) = node.utf8_text(source.as_bytes()) {
+                    let lower = text.to_ascii_lowercase();
+                    let reg_key = strip_reg_prefix(&lower).to_string();
                     if constants.contains(text) {
                         // Reference to a constant defined elsewhere.
                         push_token_node(&node, tokens, 1, MOD_READONLY);
                     } else if macros.contains(text) {
                         push_token_node(&node, tokens, 3, 0);
+                    } else if isa.registers.contains(&reg_key) {
+                        // ISA-known register name (across all enabled archs).
+                        push_token_node(&node, tokens, 1, 0);
+                    } else if isa.instructions.contains(&lower) {
+                        // ISA-known instruction mnemonic that the grammar
+                        // failed to tag as part of an `instruction` node.
+                        push_token_node(&node, tokens, 0, 0);
                     } else if labels.contains(text) {
                         push_token_node(&node, tokens, 2, 0);
                     } else {
@@ -2279,19 +2341,28 @@ fn collect_tokens(
             let parent_kind = node.parent().map(|p| p.kind()).unwrap_or("");
             if parent_kind != "instruction"
                 && let Ok(text) = node.utf8_text(source.as_bytes())
-                && macros.contains(text)
             {
-                push_token_node(&node, tokens, 3, 0);
-                recurse = false;
+                let lower = text.to_ascii_lowercase();
+                let reg_key = strip_reg_prefix(&lower).to_string();
+                if macros.contains(text) {
+                    push_token_node(&node, tokens, 3, 0);
+                    recurse = false;
+                } else if isa.registers.contains(&reg_key) {
+                    push_token_node(&node, tokens, 1, 0);
+                    recurse = false;
+                } else if isa.instructions.contains(&lower) {
+                    push_token_node(&node, tokens, 0, 0);
+                    recurse = false;
+                }
             }
         }
         _ => {}
     }
 
     if recurse && cursor.goto_first_child() {
-        collect_tokens(cursor, tokens, source, constants, labels, macros);
+        collect_tokens(cursor, tokens, source, constants, labels, macros, isa);
         while cursor.goto_next_sibling() {
-            collect_tokens(cursor, tokens, source, constants, labels, macros);
+            collect_tokens(cursor, tokens, source, constants, labels, macros, isa);
         }
         cursor.goto_parent();
     }

@@ -28,6 +28,49 @@ mod tests {
         text: String,
     }
 
+    fn run_with_isa(source: &str, isa: Option<&crate::IsaNameSets>) -> Vec<Decoded> {
+        let doc = FullTextDocument::new("asm".to_string(), 0, source.to_string());
+        let mut tree_entry = TreeEntry {
+            tree: None,
+            parser: tree_sitter::Parser::new(),
+        };
+        tree_entry
+            .parser
+            .set_language(&tree_sitter_asm::language())
+            .expect("loading asm grammar");
+        let result = get_semantic_tokens_full(&doc, &mut tree_entry, isa);
+        let tokens = match result {
+            SemanticTokensResult::Tokens(t) => t.data,
+            _ => panic!("expected tokens"),
+        };
+        let lines: Vec<&str> = source.split('\n').collect();
+        let mut out = Vec::new();
+        let mut line = 0u32;
+        let mut col = 0u32;
+        for t in tokens {
+            if t.delta_line == 0 {
+                col += t.delta_start;
+            } else {
+                line += t.delta_line;
+                col = t.delta_start;
+            }
+            let text = lines
+                .get(line as usize)
+                .and_then(|l| l.get(col as usize..(col + t.length) as usize))
+                .unwrap_or("")
+                .to_string();
+            out.push(Decoded {
+                line,
+                col,
+                len: t.length,
+                tt: t.token_type,
+                mods: t.token_modifiers_bitset,
+                text,
+            });
+        }
+        out
+    }
+
     fn run(source: &str) -> Vec<Decoded> {
         let doc = FullTextDocument::new("asm".to_string(), 0, source.to_string());
         let mut tree_entry = TreeEntry {
@@ -39,7 +82,7 @@ mod tests {
             .set_language(&tree_sitter_asm::language())
             .expect("loading asm grammar");
 
-        let result = get_semantic_tokens_full(&doc, &mut tree_entry);
+        let result = get_semantic_tokens_full(&doc, &mut tree_entry, None);
         let tokens = match result {
             SemanticTokensResult::Tokens(t) => t.data,
             _ => panic!("expected tokens"),
@@ -227,6 +270,122 @@ mod tests {
         let s = toks.iter().find(|t| t.text.starts_with('"'));
         assert!(s.is_some(), "expected a string token: {toks:?}");
         assert_eq!(s.unwrap().tt, TT_STRING);
+    }
+
+    /// Build an [`IsaNameSets`] from raw name lists for testing.
+    fn make_isa(
+        instructions: &[&str],
+        registers: &[&str],
+        directives: &[&str],
+    ) -> crate::IsaNameSets {
+        let mut s = crate::IsaNameSets::default();
+        for n in instructions {
+            s.instructions.insert((*n).to_ascii_lowercase());
+        }
+        for n in registers {
+            s.registers.insert((*n).to_ascii_lowercase());
+        }
+        for n in directives {
+            s.directives.insert((*n).to_ascii_lowercase());
+        }
+        s
+    }
+
+    /// Helper: assert that every instruction-set declared in the project gets
+    /// useful semantic highlighting when the corresponding name sets are
+    /// provided. We use a tiny, ISA-flavoured snippet per architecture and
+    /// check that registers/instructions/numbers are classified correctly.
+    #[test]
+    fn highlighting_works_for_every_instruction_set() {
+        // (name, instructions, registers, snippet)
+        let cases: &[(&str, &[&str], &[&str], &str)] = &[
+            // x86 / x86-64 (Intel / AT&T variants)
+            (
+                "x86",
+                &["mov", "add", "ret"],
+                &["eax", "ebx", "rax", "rbx"],
+                "    mov eax, 1\n    ret\n",
+            ),
+            // ARM
+            (
+                "arm",
+                &["mov", "bl", "ldr"],
+                &["r0", "r1", "sp", "lr", "pc"],
+                "    mov r0, 1\n    bl printf\n",
+            ),
+            // ARM64 / AArch64
+            (
+                "arm64",
+                &["mov", "bl", "ret"],
+                &["x0", "x1", "sp", "lr"],
+                "    mov x0, 2\n    ret\n",
+            ),
+            // RISC-V
+            (
+                "riscv",
+                &["addi", "jal", "ret"],
+                &["x0", "ra", "sp", "a0", "a1"],
+                "    addi a0, a0, 1\n    ret\n",
+            ),
+            // z80
+            (
+                "z80",
+                &["ld", "add", "ret"],
+                &["a", "b", "c", "hl", "de"],
+                "    ld a, 5\n    ret\n",
+            ),
+            // 6502
+            (
+                "6502",
+                &["lda", "sta", "jsr", "rts"],
+                &["a", "x", "y"],
+                "    lda #1\n    rts\n",
+            ),
+            // AVR
+            (
+                "avr",
+                &["ldi", "mov", "ret"],
+                &["r16", "r17", "r24"],
+                "    ldi r16, 0x01\n    ret\n",
+            ),
+            // MIPS
+            (
+                "mips",
+                &["addi", "lw", "jr"],
+                &["zero", "t0", "t1", "sp", "ra"],
+                "    addi t0, t1, 1\n    jr ra\n",
+            ),
+        ];
+
+        for (arch, instructions, registers, src) in cases {
+            let isa = make_isa(instructions, registers, &[]);
+            let toks = run_with_isa(src, Some(&isa));
+
+            // Every provided register name must appear as TT_VARIABLE.
+            for r in *registers {
+                if let Some(t) = toks.iter().find(|t| t.text.eq_ignore_ascii_case(r)) {
+                    assert_eq!(
+                        t.tt, TT_VARIABLE,
+                        "[{arch}] register {r:?} must be variable, got {t:?}\nall: {toks:?}"
+                    );
+                }
+            }
+            // At least one provided instruction must appear as TT_KEYWORD.
+            let any_kw = instructions.iter().any(|i| {
+                toks.iter()
+                    .any(|t| t.text.eq_ignore_ascii_case(i) && t.tt == TT_KEYWORD)
+            });
+            assert!(
+                any_kw,
+                "[{arch}] no instruction was classified as keyword. tokens: {toks:?}"
+            );
+            // Numbers in the snippet should be classified as numbers.
+            let any_num = toks.iter().any(|t| t.tt == TT_NUMBER);
+            assert!(
+                any_num,
+                "[{arch}] no number token detected. tokens: {toks:?}"
+            );
+        }
     }
 
     #[test]
