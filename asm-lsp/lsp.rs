@@ -1642,6 +1642,23 @@ pub struct IsaNameSets {
     pub directives: HashSet<String>,
 }
 
+/// Canonical mnemonic key used to match ISA variants like `b.eq`/`beq`.
+fn normalize_instruction_key(name: &str) -> String {
+    name.chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn isa_has_instruction_name(isa: &IsaNameSets, name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    if isa.instructions.contains(&lower) {
+        return true;
+    }
+    let normalized = normalize_instruction_key(&lower);
+    !normalized.is_empty() && isa.instructions.contains(&normalized)
+}
+
 impl IsaNameSets {
     /// Build the lookup sets from a populated [`ServerStore`].
     /// All entries are lowercased for case-insensitive matching.
@@ -1649,7 +1666,12 @@ impl IsaNameSets {
     pub fn from_store(store: &ServerStore) -> Self {
         let mut s = Self::default();
         for ((_, name), _) in &store.names_to_info.instructions {
-            s.instructions.insert(name.to_ascii_lowercase());
+            let lower = name.to_ascii_lowercase();
+            s.instructions.insert(lower.clone());
+            let normalized = normalize_instruction_key(&lower);
+            if !normalized.is_empty() {
+                s.instructions.insert(normalized);
+            }
         }
         for ((_, name), _) in &store.names_to_info.registers {
             s.registers.insert(name.to_ascii_lowercase());
@@ -1719,6 +1741,7 @@ pub fn get_semantic_tokens_full(
             &macros,
             isa,
         );
+        scan_instruction_heads(source, &comment_ranges, isa, &mut tokens);
         scan_number_literals(source, &comment_ranges, &mut tokens);
 
         // Emit a comment token for each detected comment range (if not already
@@ -2078,6 +2101,82 @@ fn scan_number_literals(source: &str, comments: &[(usize, usize)], tokens: &mut 
     }
 }
 
+fn scan_instruction_heads(
+    source: &str,
+    comments: &[(usize, usize)],
+    isa: &IsaNameSets,
+    tokens: &mut Vec<RawToken>,
+) {
+    fn is_ident_like(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'$' | b'@' | b'?')
+    }
+
+    let bytes = source.as_bytes();
+    let mut line_start = 0usize;
+    let mut line_no = 0u32;
+
+    while line_start <= bytes.len() {
+        let rel_end = bytes[line_start..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(bytes.len() - line_start, |p| p);
+        let line_end = line_start + rel_end;
+        let line = &bytes[line_start..line_end];
+
+        let mut idx = 0usize;
+        while idx < line.len() && matches!(line[idx], b' ' | b'\t') {
+            idx += 1;
+        }
+
+        // Skip leading labels (`foo:` / `1:`), then parse mnemonic.
+        loop {
+            let label_start = idx;
+            while idx < line.len() && is_ident_like(line[idx]) {
+                idx += 1;
+            }
+            if idx > label_start && idx < line.len() && line[idx] == b':' {
+                idx += 1;
+                while idx < line.len() && matches!(line[idx], b' ' | b'\t') {
+                    idx += 1;
+                }
+                continue;
+            }
+            idx = label_start;
+            break;
+        }
+
+        let mne_start = idx;
+        while idx < line.len() && is_ident_like(line[idx]) {
+            idx += 1;
+        }
+
+        if idx > mne_start {
+            let abs_start = line_start + mne_start;
+            let abs_end = line_start + idx;
+            if !is_in_comment(abs_start, abs_end, comments)
+                && let Ok(mnemonic) = std::str::from_utf8(&line[mne_start..idx])
+                && isa_has_instruction_name(isa, mnemonic)
+            {
+                tokens.push(RawToken {
+                    line: line_no,
+                    start: mne_start as u32,
+                    length: (idx - mne_start) as u32,
+                    token_type: 0,
+                    token_modifiers_bitset: 0,
+                    start_byte: abs_start,
+                    end_byte: abs_end,
+                });
+            }
+        }
+
+        if line_end >= bytes.len() {
+            break;
+        }
+        line_start = line_end + 1;
+        line_no += 1;
+    }
+}
+
 /// Returns true if the [start, end) byte range overlaps any comment range.
 fn is_in_comment(start: usize, end: usize, ranges: &[(usize, usize)]) -> bool {
     // ranges sorted by .0; linear scan acceptable, ranges typically small
@@ -2324,7 +2423,7 @@ fn collect_tokens(
                     } else if isa.registers.contains(&reg_key) {
                         // ISA-known register name (across all enabled archs).
                         push_token_node(&node, tokens, 1, 0);
-                    } else if isa.instructions.contains(&lower) {
+                    } else if isa_has_instruction_name(isa, &lower) {
                         // ISA-known instruction mnemonic that the grammar
                         // failed to tag as part of an `instruction` node.
                         push_token_node(&node, tokens, 0, 0);
@@ -2337,7 +2436,7 @@ fn collect_tokens(
             }
             recurse = false;
         }
-        "word" => {
+        "word" | "opcode" | "mnemonic" => {
             let parent_kind = node.parent().map(|p| p.kind()).unwrap_or("");
             if parent_kind != "instruction"
                 && let Ok(text) = node.utf8_text(source.as_bytes())
@@ -2350,7 +2449,7 @@ fn collect_tokens(
                 } else if isa.registers.contains(&reg_key) {
                     push_token_node(&node, tokens, 1, 0);
                     recurse = false;
-                } else if isa.instructions.contains(&lower) {
+                } else if isa_has_instruction_name(isa, &lower) {
                     push_token_node(&node, tokens, 0, 0);
                     recurse = false;
                 }

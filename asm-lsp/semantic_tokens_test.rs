@@ -272,6 +272,22 @@ mod tests {
         assert_eq!(s.unwrap().tt, TT_STRING);
     }
 
+    #[test]
+    fn dotted_instruction_variants_are_keywords_with_isa_fallback() {
+        let src = "    b.eq label\n    vadd.i32 q0, q1, q2\nlabel:\n";
+        let isa = make_isa(&["beq", "vaddi32"], &["q0", "q1", "q2"], &[]);
+        let toks = run_with_isa(src, Some(&isa));
+
+        assert!(
+            toks.iter().any(|t| t.text.eq_ignore_ascii_case("b.eq") && t.tt == TT_KEYWORD),
+            "expected 'b.eq' keyword token, got: {toks:?}"
+        );
+        assert!(
+            toks.iter().any(|t| t.text.eq_ignore_ascii_case("vadd.i32") && t.tt == TT_KEYWORD),
+            "expected 'vadd.i32' keyword token, got: {toks:?}"
+        );
+    }
+
     /// Build an [`IsaNameSets`] from raw name lists for testing.
     fn make_isa(
         instructions: &[&str],
