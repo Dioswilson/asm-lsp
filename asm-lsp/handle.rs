@@ -154,6 +154,9 @@ pub fn handle_request(
         }
         DocumentDiagnosticRequest::METHOD => {
             let (_id, params) = cast_req!(req, DocumentDiagnosticRequest);
+            if !is_supported_asm_uri(&params.text_document.uri) {
+                return Ok(());
+            }
             let project_config = config.get_config(&params.text_document.uri);
             // Ok to unwrap, this should never be `None`
             if project_config.opts.as_ref().unwrap().diagnostics.unwrap() {
@@ -233,6 +236,11 @@ pub fn handle_notification(
         }
         DidSaveTextDocument::METHOD => {
             let params = cast_notif!(notif, DidSaveTextDocument);
+            if !is_supported_asm_uri(&params.text_document.uri)
+                || !doc_store.tree_store.contains_key(&params.text_document.uri)
+            {
+                return Ok(());
+            }
             let project_config = config.get_config(&params.text_document.uri);
             // Ok to unwrap, this should never be `None`
             if project_config.opts.as_ref().unwrap().diagnostics.unwrap() {
@@ -284,6 +292,25 @@ where
         // Fixme please
         Err(e) => Err(anyhow::anyhow!("Error: {e}")),
     }
+}
+
+fn is_supported_asm_language_id(language_id: &str) -> bool {
+    matches!(
+        language_id.to_ascii_lowercase().as_str(),
+        "asm" | "assembly"
+    )
+}
+
+fn is_supported_asm_uri(uri: &Uri) -> bool {
+    std::path::Path::new(uri.path().as_str())
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|ext| matches!(ext.to_ascii_lowercase().as_str(), "asm" | "s"))
+}
+
+fn is_supported_asm_document(uri: &Uri, language_id: Option<&str>) -> bool {
+    let has_supported_language = language_id.is_some_and(is_supported_asm_language_id);
+    has_supported_language || is_supported_asm_uri(uri)
 }
 
 /// Handles hover requests
@@ -559,6 +586,10 @@ pub fn handle_diagnostics(
     cfg: &Config,
     compile_cmds: &CompilationDatabase,
 ) -> Result<()> {
+    if !is_supported_asm_uri(uri) {
+        return Ok(());
+    }
+
     let req_source_path = match process_uri(uri) {
         UriConversion::Canonicalized(p) => p,
         UriConversion::Unchecked(p) => {
@@ -653,6 +684,13 @@ pub fn handle_did_open_text_document_notification(
     params: &DidOpenTextDocumentParams,
     doc_store: &mut DocumentStore,
 ) {
+    if !is_supported_asm_document(
+        &params.text_document.uri,
+        Some(params.text_document.language_id.as_str()),
+    ) {
+        return;
+    }
+
     let raw_params = serde_json::to_value(params).unwrap();
     doc_store
         .text_store
@@ -684,12 +722,16 @@ pub fn handle_did_change_text_document_notification(
     params: &DidChangeTextDocumentParams,
     doc_store: &mut DocumentStore,
 ) -> Result<()> {
+    let uri = &params.text_document.uri;
+    if !is_supported_asm_uri(uri) || !doc_store.tree_store.contains_key(uri) {
+        return Ok(());
+    }
+
     let raw_params = serde_json::to_value(params).unwrap();
     doc_store
         .text_store
         .listen(DidChangeTextDocument::METHOD, &raw_params);
 
-    let uri = &params.text_document.uri;
     if let Some(ref mut doc) = doc_store.text_store.get_document(uri)
         && let Some(tree_entry) = doc_store.tree_store.get_mut(uri)
         && let Some(ref mut curr_tree) = tree_entry.tree
@@ -716,9 +758,94 @@ pub fn handle_did_close_text_document_notification(
     params: &DidCloseTextDocumentParams,
     doc_store: &mut DocumentStore,
 ) {
+    if !is_supported_asm_uri(&params.text_document.uri)
+        && !doc_store.tree_store.contains_key(&params.text_document.uri)
+    {
+        return;
+    }
+
     let raw_params = serde_json::to_value(params).unwrap();
     doc_store
         .text_store
         .listen(DidCloseTextDocument::METHOD, &raw_params);
     doc_store.tree_store.remove(&params.text_document.uri);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use lsp_types::{
+        DidChangeTextDocumentParams, DidOpenTextDocumentParams, TextDocumentContentChangeEvent,
+        TextDocumentItem, VersionedTextDocumentIdentifier,
+    };
+
+    use crate::{DocumentStore, handle::*};
+
+    #[test]
+    fn asm_document_filters_reject_non_asm_language_and_extension() {
+        let c_uri = Uri::from_str("file:///tmp/main.c").unwrap();
+        assert!(!is_supported_asm_document(&c_uri, Some("c")));
+        assert!(!is_supported_asm_uri(&c_uri));
+        assert!(!is_supported_asm_language_id("c"));
+    }
+
+    #[test]
+    fn handle_did_open_ignores_non_asm_documents() {
+        let mut doc_store = DocumentStore::new();
+        let c_uri = Uri::from_str("file:///tmp/main.c").unwrap();
+        let params = DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: c_uri.clone(),
+                language_id: "c".to_string(),
+                version: 1,
+                text: "int main(void) { return 0; }".to_string(),
+            },
+        };
+
+        handle_did_open_text_document_notification(&params, &mut doc_store);
+
+        assert!(doc_store.text_store.get_document(&c_uri).is_none());
+        assert!(!doc_store.tree_store.contains_key(&c_uri));
+    }
+
+    #[test]
+    fn handle_did_open_accepts_asm_documents() {
+        let mut doc_store = DocumentStore::new();
+        let asm_uri = Uri::from_str("file:///tmp/main.S").unwrap();
+        let params = DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: asm_uri.clone(),
+                language_id: "asm".to_string(),
+                version: 1,
+                text: "mov eax, eax".to_string(),
+            },
+        };
+
+        handle_did_open_text_document_notification(&params, &mut doc_store);
+
+        assert!(doc_store.text_store.get_document(&asm_uri).is_some());
+        assert!(doc_store.tree_store.contains_key(&asm_uri));
+    }
+
+    #[test]
+    fn handle_did_change_ignores_non_asm_uri() {
+        let mut doc_store = DocumentStore::new();
+        let c_uri = Uri::from_str("file:///tmp/main.c").unwrap();
+        let params = DidChangeTextDocumentParams {
+            text_document: VersionedTextDocumentIdentifier {
+                uri: c_uri,
+                version: 2,
+            },
+            content_changes: vec![TextDocumentContentChangeEvent {
+                range: None,
+                range_length: None,
+                text: "int x = 1;".to_string(),
+            }],
+        };
+
+        let result = handle_did_change_text_document_notification(&params, &mut doc_store);
+        assert!(result.is_ok());
+        assert!(doc_store.text_store.get_document(&params.text_document.uri).is_none());
+    }
 }
