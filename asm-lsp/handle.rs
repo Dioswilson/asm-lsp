@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use compile_commands::{CompilationDatabase, SourceFile};
 use log::{error, info, warn};
 use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
@@ -23,7 +23,7 @@ use crate::{
     ServerStore, TreeEntry, UriConversion, apply_compile_cmd, get_comp_resp,
     get_compile_cmd_for_req, get_default_compile_cmd, get_document_symbols, get_goto_def_resp,
     get_hover_resp, get_ref_resp, get_semantic_tokens_full, get_sig_help_resp,
-    get_word_from_pos_params, process_uri, send_empty_resp, text_doc_change_to_ts_edit,
+    get_word_from_pos_params, process_uri, send_empty_resp,
 };
 
 // A bug in Neovim can cause client->server RPC messages to be corrupted. If this
@@ -708,8 +708,9 @@ pub fn handle_did_open_text_document_notification(
 }
 
 /// Handles did change text document notifications
-/// Edits are applied to `curr_doc` and `tree`, but `tree` is not
-/// re-parsed
+///
+/// The text document is updated in `text_store` and the cached syntax tree is
+/// invalidated, forcing a re-parse from the latest buffer on the next request.
 ///
 /// # Errors
 ///
@@ -732,18 +733,8 @@ pub fn handle_did_change_text_document_notification(
         .text_store
         .listen(DidChangeTextDocument::METHOD, &raw_params);
 
-    if let Some(ref mut doc) = doc_store.text_store.get_document(uri)
-        && let Some(tree_entry) = doc_store.tree_store.get_mut(uri)
-        && let Some(ref mut curr_tree) = tree_entry.tree
-    {
-        for change in &params.content_changes {
-            match text_doc_change_to_ts_edit(change, doc) {
-                Ok(edit) => curr_tree.edit(&edit),
-                Err(e) => {
-                    return Err(anyhow!("Bad edit info, failed to edit tree - Error: {e}"));
-                }
-            }
-        }
+    if let Some(tree_entry) = doc_store.tree_store.get_mut(uri) {
+        tree_entry.tree = None;
     }
 
     Ok(())
@@ -776,11 +767,49 @@ mod tests {
     use std::str::FromStr;
 
     use lsp_types::{
-        DidChangeTextDocumentParams, DidOpenTextDocumentParams, TextDocumentContentChangeEvent,
-        TextDocumentItem, VersionedTextDocumentIdentifier,
+        DidChangeTextDocumentParams, DidOpenTextDocumentParams, Position, Range,
+        SemanticTokensResult, TextDocumentContentChangeEvent, TextDocumentItem,
+        VersionedTextDocumentIdentifier,
     };
 
-    use crate::{DocumentStore, handle::*};
+    use crate::{DocumentStore, get_semantic_tokens_full, handle::*};
+
+    #[derive(Debug)]
+    struct Decoded {
+        tt: u32,
+        text: String,
+    }
+
+    fn decode_tokens(source: &str, result: SemanticTokensResult) -> Vec<Decoded> {
+        let tokens = match result {
+            SemanticTokensResult::Tokens(t) => t.data,
+            _ => panic!("expected full semantic tokens"),
+        };
+
+        let lines: Vec<&str> = source.split('\n').collect();
+        let mut out = Vec::new();
+        let mut line = 0u32;
+        let mut col = 0u32;
+        for t in tokens {
+            if t.delta_line == 0 {
+                col += t.delta_start;
+            } else {
+                line += t.delta_line;
+                col = t.delta_start;
+            }
+
+            let text = lines
+                .get(line as usize)
+                .and_then(|l| l.get(col as usize..(col + t.length) as usize))
+                .unwrap_or("")
+                .to_string();
+            out.push(Decoded {
+                tt: t.token_type,
+                text,
+            });
+        }
+        out
+    }
 
     #[test]
     fn asm_document_filters_reject_non_asm_language_and_extension() {
@@ -847,5 +876,68 @@ mod tests {
         let result = handle_did_change_text_document_notification(&params, &mut doc_store);
         assert!(result.is_ok());
         assert!(doc_store.text_store.get_document(&params.text_document.uri).is_none());
+    }
+
+    #[test]
+    fn semantic_tokens_remain_consistent_after_line_deletion_via_did_change() {
+        const TT_FUNCTION: u32 = 2;
+
+        let mut doc_store = DocumentStore::new();
+        let asm_uri = Uri::from_str("file:///tmp/main.S").unwrap();
+        let old_source = ".extern printf\n    mov %rax, %rax\n    call printf\n";
+        let new_source = ".extern printf\n    call printf\n";
+
+        handle_did_open_text_document_notification(
+            &DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: asm_uri.clone(),
+                    language_id: "asm".to_string(),
+                    version: 1,
+                    text: old_source.to_string(),
+                },
+            },
+            &mut doc_store,
+        );
+
+        let change = DidChangeTextDocumentParams {
+            text_document: VersionedTextDocumentIdentifier {
+                uri: asm_uri.clone(),
+                version: 2,
+            },
+            content_changes: vec![TextDocumentContentChangeEvent {
+                range: Some(Range {
+                    start: Position {
+                        line: 1,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 2,
+                        character: 0,
+                    },
+                }),
+                range_length: None,
+                text: String::new(),
+            }],
+        };
+
+        handle_did_change_text_document_notification(&change, &mut doc_store)
+            .expect("didChange must succeed");
+
+        let doc = doc_store
+            .text_store
+            .get_document(&asm_uri)
+            .expect("updated document");
+        assert_eq!(doc.get_content(None), new_source);
+
+        let tree_entry = doc_store.tree_store.get_mut(&asm_uri).expect("tree entry");
+        let tokens = get_semantic_tokens_full(doc, tree_entry, None);
+        let decoded = decode_tokens(new_source, tokens);
+
+        let printf_tokens: Vec<&Decoded> = decoded.iter().filter(|t| t.text == "printf").collect();
+        assert_eq!(printf_tokens.len(), 2, "expected extern + call use: {decoded:?}");
+        assert!(
+            printf_tokens.iter().all(|t| t.tt == TT_FUNCTION),
+            "printf tokens must remain function after edit: {decoded:?}"
+        );
     }
 }
