@@ -878,13 +878,16 @@ pub fn text_doc_change_to_ts_edit(
     let start = range.start;
     let end = range.end;
 
-    let start_byte = doc.offset_at(start) as usize;
-    let new_end_byte = start_byte + change.text.len();
+    let doc_len = doc.get_content(None).len();
+    let start_byte = (doc.offset_at(start) as usize).min(doc_len);
+    let old_end_byte = (doc.offset_at(end) as usize).min(doc_len);
+    let old_end_byte = old_end_byte.max(start_byte);
+    let new_end_byte = start_byte.saturating_add(change.text.len());
     let new_end_pos = doc.position_at(u32::try_from(new_end_byte)?);
 
     Ok(tree_sitter::InputEdit {
         start_byte,
-        old_end_byte: doc.offset_at(end) as usize,
+        old_end_byte,
         new_end_byte,
         start_position: tree_sitter::Point {
             row: start.line as usize,
@@ -2177,6 +2180,9 @@ pub fn get_semantic_tokens_full(
         // Emit a comment token for each detected comment range (if not already
         // covered by a grammar-produced comment token at the same position).
         for &(s, e) in &comment_ranges {
+            if s >= source.len() || e > source.len() || s >= e {
+                continue;
+            }
             // Compute line/col from byte offset.
             let prefix = &source[..s];
             let line = prefix.bytes().filter(|b| *b == b'\n').count() as u32;
@@ -2277,6 +2283,21 @@ struct RawToken {
     end_byte: usize,
 }
 
+fn node_byte_range_checked(node: &tree_sitter::Node, source: &str) -> Option<(usize, usize)> {
+    let start = node.start_byte();
+    let end = node.end_byte();
+    let len = source.len();
+    if start > end || end > len {
+        return None;
+    }
+    Some((start, end))
+}
+
+fn node_text_checked<'a>(node: &tree_sitter::Node, source: &'a str) -> Option<&'a str> {
+    let (start, end) = node_byte_range_checked(node, source)?;
+    std::str::from_utf8(&source.as_bytes()[start..end]).ok()
+}
+
 fn push_token_node(node: &tree_sitter::Node, tokens: &mut Vec<RawToken>, tt: u32, mods: u32) {
     let start = node.start_position();
     let end = node.end_position();
@@ -2301,7 +2322,9 @@ fn push_token_node_to_eol(
     mods: u32,
 ) {
     let start = node.start_position();
-    let start_byte = node.start_byte();
+    let Some((start_byte, _)) = node_byte_range_checked(node, source) else {
+        return;
+    };
     let slice = &source.as_bytes()[start_byte..];
     let rel_end = slice.iter().position(|&b| b == b'\n').unwrap_or(slice.len());
     let end_col = start.column as usize + rel_end;
@@ -2638,14 +2661,17 @@ fn collect_prepass(
             // Extend single-line comments to end-of-line so trailing text in the
             // same logical comment is also covered.
             let bytes = source.as_bytes();
+            if start_byte >= bytes.len() {
+                return;
+            }
             let end_byte = if kind == "block_comment" || kind == "comment_block" {
-                node.end_byte()
+                node.end_byte().min(bytes.len())
             } else {
                 let rel = bytes[start_byte..]
                     .iter()
                     .position(|&b| b == b'\n')
                     .map_or(bytes.len(), |p| start_byte + p);
-                rel.max(node.end_byte())
+                rel.max(node.end_byte().min(bytes.len()))
             };
             comments.push((start_byte, end_byte));
         }
@@ -2655,7 +2681,7 @@ fn collect_prepass(
                 loop {
                     let ch = c.node();
                     if ch.kind() == "ident" {
-                        if let Ok(name) = ch.utf8_text(source.as_bytes()) {
+                        if let Some(name) = node_text_checked(&ch, source) {
                             labels.insert(name.to_string());
                         }
                         break;
@@ -2668,7 +2694,7 @@ fn collect_prepass(
         }
         // Detect `.equ NAME, value` / `.set NAME, value` directive forms.
         "meta" => {
-            if let Ok(text) = node.utf8_text(source.as_bytes()) {
+            if let Some(text) = node_text_checked(&node, source) {
                 let trimmed = text.trim_start();
                 let is_equ = trimmed.starts_with(".equ ")
                     || trimmed.starts_with(".set ")
@@ -2682,7 +2708,7 @@ fn collect_prepass(
                         loop {
                             let ch = c.node();
                             if ch.kind() == "ident" {
-                                if let Ok(name) = ch.utf8_text(source.as_bytes()) {
+                                if let Some(name) = node_text_checked(&ch, source) {
                                     constants.insert(name.to_string());
                                 }
                                 break;
@@ -2702,16 +2728,18 @@ fn collect_prepass(
     // `;` (many assemblers), `#` (gas-style line comments) when grammar
     // doesn't expose a comment node.
     if node.child_count() == 0 && !matches!(kind, "comment" | "line_comment" | "block_comment") {
-        if let Ok(txt) = node.utf8_text(source.as_bytes()) {
+        if let Some(txt) = node_text_checked(&node, source) {
             let t = txt.trim_start();
             if t.starts_with('@') {
                 let start_byte = node.start_byte();
                 let bytes = source.as_bytes();
-                let end = bytes[start_byte..]
-                    .iter()
-                    .position(|&b| b == b'\n')
-                    .map_or(bytes.len(), |p| start_byte + p);
-                comments.push((start_byte, end));
+                if start_byte < bytes.len() {
+                    let end = bytes[start_byte..]
+                        .iter()
+                        .position(|&b| b == b'\n')
+                        .map_or(bytes.len(), |p| start_byte + p);
+                    comments.push((start_byte, end));
+                }
             }
         }
     }
@@ -2813,7 +2841,7 @@ fn collect_tokens(
                 let mut is_equ_lhs = false;
                 if let Some(parent) = node.parent() {
                     if parent.kind() == "meta" {
-                        if let Ok(txt) = parent.utf8_text(source.as_bytes()) {
+                        if let Some(txt) = node_text_checked(&parent, source) {
                             let trimmed = txt.trim_start();
                             let is_equ = trimmed.starts_with(".equ")
                                 || trimmed.starts_with(".set")
@@ -2842,7 +2870,7 @@ fn collect_tokens(
 
                 if is_equ_lhs {
                     push_token_node(&node, tokens, 1, MOD_READONLY);
-                } else if let Ok(text) = node.utf8_text(source.as_bytes()) {
+                } else if let Some(text) = node_text_checked(&node, source) {
                     let lower = text.to_ascii_lowercase();
                     let reg_key = strip_reg_prefix(&lower).to_string();
                     if constants.contains(text) {
@@ -2869,7 +2897,7 @@ fn collect_tokens(
         "word" | "opcode" | "mnemonic" => {
             let parent_kind = node.parent().map(|p| p.kind()).unwrap_or("");
             if parent_kind != "instruction"
-                && let Ok(text) = node.utf8_text(source.as_bytes())
+                && let Some(text) = node_text_checked(&node, source)
             {
                 let lower = text.to_ascii_lowercase();
                 let reg_key = strip_reg_prefix(&lower).to_string();

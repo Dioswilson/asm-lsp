@@ -508,4 +508,29 @@ main:
         let comment = toks.iter().find(|t| t.tt == TT_COMMENT).expect("comment");
         assert!(comment.text.starts_with('@'));
     }
+
+    #[test]
+    fn semantic_tokens_no_panic_after_line_deletion_with_old_tree() {
+        let old_source = "start:\n    mov eax, 1\n    call ext_fn\n; trailing comment\n";
+        let new_source = "start:\n";
+
+        let doc = FullTextDocument::new("asm".to_string(), 1, new_source.to_string());
+        let mut tree_entry = TreeEntry {
+            tree: None,
+            parser: tree_sitter::Parser::new(),
+        };
+        tree_entry
+            .parser
+            .set_language(&tree_sitter_asm::language())
+            .expect("loading asm grammar");
+
+        // Simula el caso incremental: parse previo con texto más largo,
+        // luego semantic tokens sobre un buffer más corto tras borrado.
+        tree_entry.tree = tree_entry.parser.parse(old_source, None);
+
+        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            get_semantic_tokens_full(&doc, &mut tree_entry, None)
+        }));
+        assert!(out.is_ok(), "semantic tokens panicked after line deletion");
+    }
 }
