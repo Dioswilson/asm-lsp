@@ -12,6 +12,7 @@ mod tests {
     const TT_NUMBER: u32 = 5;
     const TT_STRING: u32 = 6;
     const TT_COMMENT: u32 = 7;
+    const TT_EXTERN_SYMBOL: u32 = 9;
 
     // Modifier bit positions (must match SEMANTIC_TOKENS_LEGEND modifier order)
     const MOD_READONLY: u32 = 1 << 0;
@@ -200,15 +201,76 @@ mod tests {
     }
 
     #[test]
-    fn extern_argument_is_not_readonly() {
+    fn extern_argument_without_use_is_extern_symbol() {
+        // Declared extern with no in-document use and no type directive.
         let src = ".extern printf\n";
         let toks = run(src);
         let p = find(&toks, "printf").expect("printf ident");
-        assert_eq!(p.tt, TT_VARIABLE, ".extern arg must not be function");
+        assert_eq!(
+            p.tt, TT_EXTERN_SYMBOL,
+            ".extern arg without use must be externSymbol"
+        );
         assert!(
             p.mods & MOD_READONLY == 0,
             ".extern arg must not be readonly: {p:?}"
         );
+    }
+
+    #[test]
+    fn extern_used_in_call_is_function() {
+        let src = ".extern printf\n    call printf\n";
+        let toks = run(src);
+        for p in toks.iter().filter(|t| t.text == "printf") {
+            assert_eq!(p.tt, TT_FUNCTION, "printf must be function (used in call)");
+        }
+    }
+
+    #[test]
+    fn extern_used_in_load_is_variable() {
+        let src = ".extern data\n    mov data, %rax\n";
+        let toks = run(src);
+        for p in toks.iter().filter(|t| t.text == "data") {
+            assert_eq!(p.tt, TT_VARIABLE, "data must be variable (used in mov)");
+        }
+    }
+
+    #[test]
+    fn extern_call_wins_over_mem() {
+        // Priority check: even if `lea`/`mov` reference the symbol first,
+        // a later `call` reference must classify it as a function.
+        let src = ".extern handler\n    lea handler(%rip), %rax\n    call handler\n";
+        let toks = run(src);
+        for p in toks.iter().filter(|t| t.text == "handler") {
+            assert_eq!(
+                p.tt, TT_FUNCTION,
+                "handler must be function (call outranks lea/mov)"
+            );
+        }
+    }
+
+    #[test]
+    fn extern_type_directive_function_wins_over_use() {
+        // Explicit `.type @function` must beat a memory-style use.
+        let src = ".extern sym\n.type sym, @function\n    mov sym, %rax\n";
+        let toks = run(src);
+        for p in toks.iter().filter(|t| t.text == "sym") {
+            assert_eq!(
+                p.tt, TT_FUNCTION,
+                "explicit .type @function must win over mov use"
+            );
+        }
+    }
+
+    #[test]
+    fn extern_type_directive_object_is_variable() {
+        let src = ".extern g_flag\n.type g_flag, @object\n    call g_flag\n";
+        let toks = run(src);
+        for p in toks.iter().filter(|t| t.text == "g_flag") {
+            assert_eq!(
+                p.tt, TT_VARIABLE,
+                "explicit .type @object must win over call use"
+            );
+        }
     }
 
     #[test]
@@ -418,10 +480,11 @@ main:
 
         // .extern marker is keyword
         assert_eq!(find(&toks, ".extern").unwrap().tt, TT_KEYWORD);
-        // printf is an unresolved external/generic identifier, not a label.
+        // printf is a declared extern used via `bl`, so it must be a function.
         let printf_refs: Vec<&Decoded> = toks.iter().filter(|t| t.text == "printf").collect();
+        assert!(!printf_refs.is_empty(), "printf tokens expected: {toks:?}");
         for p in &printf_refs {
-            assert_eq!(p.tt, TT_VARIABLE, "printf should be generic variable");
+            assert_eq!(p.tt, TT_FUNCTION, "printf used in `bl` must be function");
             assert!(p.mods & MOD_READONLY == 0);
         }
         // .equ marker is keyword, CONST is variable + readonly

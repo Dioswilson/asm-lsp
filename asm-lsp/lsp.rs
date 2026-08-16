@@ -55,6 +55,7 @@ pub static SEMANTIC_TOKENS_LEGEND: LazyLock<SemanticTokensLegend> = LazyLock::ne
             SemanticTokenType::STRING,    // 6: String literals
             SemanticTokenType::COMMENT,   // 7: Comments
             SemanticTokenType::NAMESPACE, // 8: Namespaces
+            SemanticTokenType::new("externSymbol"), // 9: Extern symbols (unresolved type)
         ],
         token_modifiers: vec![
             SemanticTokenModifier::READONLY,   // bit 0
@@ -1686,6 +1687,428 @@ impl IsaNameSets {
     }
 }
 
+// -----------------------------------------------------------------------------
+// Extern symbol classification (shared across ALL supported ISAs).
+//
+// Classification priority (highest wins):
+//   1. Explicit dialect type directive (.type @function/@object, PROC, DWORD, ...)
+//   2. Use inside a call/branch-like mnemonic operand  -> function
+//   3. Use inside a load/store/memory arithmetic operand -> variable
+//   4. Fallback (declared extern, no known use) -> externSymbol (token id 9)
+// -----------------------------------------------------------------------------
+
+/// Semantic classification assigned to an `extern` symbol.
+///
+/// Numeric values encode priority — a strictly greater value replaces a lower one
+/// when the same symbol is analyzed multiple times.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum ExternKind {
+    /// Default: declared extern but no type directive and no in-document use.
+    Unknown = 0,
+    /// Referenced from a load/store/memory instruction.
+    Variable = 1,
+    /// Referenced from a call/branch/jump instruction.
+    Function = 2,
+    /// Type explicitly declared by a dialect directive (highest priority).
+    ExplicitFunction = 3,
+    /// Type explicitly declared by a dialect directive (highest priority).
+    ExplicitVariable = 4,
+}
+
+impl ExternKind {
+    fn token_type(self) -> u32 {
+        match self {
+            Self::Unknown => 9, // externSymbol
+            Self::Variable | Self::ExplicitVariable => 1, // variable
+            Self::Function | Self::ExplicitFunction => 2, // function
+        }
+    }
+}
+
+/// Mnemonics (normalized, lowercase) that transfer control flow. If an extern
+/// symbol appears as an operand of one of these, it is a function.
+///
+/// Union across all supported ISAs (x86/x86-64, ARM/ARM64, RISC-V, MIPS,
+/// PowerISA, AVR, Z80, 6502). Overlap between ISAs is harmless because the
+/// document is parsed under a single ISA context and mnemonics of other ISAs
+/// simply won't appear.
+static CALL_LIKE_MNEMONICS: &[&str] = &[
+    // x86 / x86-64
+    "call", "callq", "calll", "callw", "jmp", "jmpq", "jmpl", "ljmp", "lcall",
+    "je", "jne", "jz", "jnz", "jg", "jge", "jl", "jle", "ja", "jae", "jb", "jbe",
+    "jo", "jno", "js", "jns", "jc", "jnc", "jp", "jnp", "jpe", "jpo", "jcxz", "jecxz", "jrcxz",
+    "loop", "loope", "loopne", "loopz", "loopnz",
+    // ARM / ARM64
+    "b", "bl", "blx", "bx", "blr", "br", "cbz", "cbnz", "tbz", "tbnz",
+    "beq", "bne", "bcs", "bhs", "bcc", "blo", "bmi", "bpl", "bvs", "bvc",
+    "bhi", "bls", "bge", "blt", "bgt", "ble", "bal",
+    // RISC-V
+    "jal", "jalr", "j", "jr", "tail", "ret",
+    "beqz", "bnez", "bltz", "bgez", "bgtz", "blez", "bltu", "bgeu",
+    // MIPS (jal/j/jr already covered)
+    "bal", "bltzal", "bgezal", "bgezall", "bltzall",
+    // PowerISA
+    "bc", "bca", "bcl", "bcla", "bctr", "bctrl", "blr", "blrl", "ba", "bla",
+    // AVR
+    "rcall", "icall", "rjmp", "ijmp", "eicall", "eijmp",
+    "brcc", "brcs", "breq", "brne", "brge", "brlt", "brmi", "brpl", "brsh", "brlo",
+    // Z80
+    "jp", "jr", "djnz", "rst",
+    // 6502
+    "jsr", "bcc", "bcs", "beq", "bne", "bmi", "bpl", "bvs", "bvc",
+];
+
+/// Mnemonics that read/write memory (or compute an address that is meant to be
+/// dereferenced). If an extern symbol appears as an operand of one of these,
+/// it is classified as a variable.
+static MEM_LIKE_MNEMONICS: &[&str] = &[
+    // x86 / x86-64
+    "mov", "movl", "movq", "movw", "movb", "movabs",
+    "movs", "movsb", "movsw", "movsl", "movsq",
+    "movzx", "movsx", "movzbl", "movsbl", "movzwl", "movswl",
+    "lea", "leaq", "leal", "leaw",
+    "push", "pushq", "pushl", "pop", "popq", "popl",
+    "add", "sub", "cmp", "test", "and", "or", "xor",
+    // ARM / ARM64
+    "ldr", "ldrb", "ldrh", "ldrsb", "ldrsh", "ldrsw",
+    "str", "strb", "strh",
+    "ldp", "stp", "ldm", "stm", "ldmia", "stmia", "ldmdb", "stmdb",
+    "adr", "adrp",
+    // RISC-V
+    "lb", "lh", "lw", "ld", "lbu", "lhu", "lwu",
+    "sb", "sh", "sw", "sd",
+    "la", "lla",
+    // MIPS
+    "lwl", "lwr", "swl", "swr", "ll", "sc",
+    // PowerISA
+    "lwz", "lwzu", "lwzx", "lhz", "lha", "lbz", "ld", "ldu", "ldx",
+    "stw", "stwu", "stwx", "sth", "stb", "std", "stdu",
+    // AVR
+    "lds", "sts", "ldi",
+    // Z80 (ld covers most; already listed)
+    // 6502
+    "lda", "sta", "ldx", "stx", "ldy", "sty", "inc", "dec",
+];
+
+fn call_like_set() -> HashSet<&'static str> {
+    CALL_LIKE_MNEMONICS.iter().copied().collect()
+}
+
+fn mem_like_set() -> HashSet<&'static str> {
+    MEM_LIKE_MNEMONICS.iter().copied().collect()
+}
+
+/// Extract the first mnemonic-looking token from a source line, skipping
+/// leading labels of the form `foo:` / `1:`.
+fn line_mnemonic(line: &str) -> Option<&str> {
+    fn is_ident_like(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'$' | b'@' | b'?')
+    }
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && matches!(bytes[i], b' ' | b'\t') {
+        i += 1;
+    }
+    // Skip labels
+    loop {
+        let start = i;
+        while i < bytes.len() && is_ident_like(bytes[i]) {
+            i += 1;
+        }
+        if i > start && i < bytes.len() && bytes[i] == b':' {
+            i += 1;
+            while i < bytes.len() && matches!(bytes[i], b' ' | b'\t') {
+                i += 1;
+            }
+            continue;
+        }
+        i = start;
+        break;
+    }
+    let mne_start = i;
+    while i < bytes.len() && is_ident_like(bytes[i]) {
+        i += 1;
+    }
+    if i > mne_start {
+        Some(&line[mne_start..i])
+    } else {
+        None
+    }
+}
+
+/// Iterate lines with their (line_index, byte_start, content) tuple.
+fn iter_source_lines(source: &str) -> impl Iterator<Item = (u32, usize, &str)> {
+    let mut line_no: u32 = 0;
+    let mut start = 0usize;
+    let bytes = source.as_bytes();
+    std::iter::from_fn(move || {
+        if start > bytes.len() {
+            return None;
+        }
+        let rel = bytes[start..].iter().position(|&b| b == b'\n');
+        let end = match rel {
+            Some(p) => start + p,
+            None => bytes.len(),
+        };
+        let content = &source[start..end];
+        let out = (line_no, start, content);
+        line_no += 1;
+        start = end + 1;
+        if rel.is_none() {
+            // Ensure we terminate after emitting the last (possibly unterminated) line.
+            start = bytes.len() + 1;
+        }
+        Some(out)
+    })
+}
+
+/// Analyze the document source for `extern` declarations and type directives,
+/// producing a map `symbol -> ExternKind` with the *final* classification per
+/// symbol (priority already resolved).
+///
+/// This scanner is intentionally regex/line based (no AST): the tree-sitter-asm
+/// grammar exposes few dialect-specific type directives, and the same logic
+/// must work across all supported ISAs.
+fn collect_extern_symbols(
+    source: &str,
+    comments: &[(usize, usize)],
+    call_like: &HashSet<&'static str>,
+    mem_like: &HashSet<&'static str>,
+) -> HashMap<String, ExternKind> {
+    let mut externs: HashMap<String, ExternKind> = HashMap::new();
+
+    /// Update the classification only if `new` has strictly higher priority.
+    fn bump(map: &mut HashMap<String, ExternKind>, name: &str, new: ExternKind) {
+        let entry = map.entry(name.to_string()).or_insert(ExternKind::Unknown);
+        if (new as u8) > (*entry as u8) {
+            *entry = new;
+        }
+    }
+
+    fn is_ident_start(b: u8) -> bool {
+        b.is_ascii_alphabetic() || b == b'_' || b == b'.' || b == b'$'
+    }
+    fn is_ident_cont(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'$' | b'@' | b'?')
+    }
+
+    /// Extract all identifier-like tokens from a line slice.
+    fn idents_in(text: &str) -> Vec<&str> {
+        let bytes = text.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            if is_ident_start(bytes[i]) {
+                let s = i;
+                while i < bytes.len() && is_ident_cont(bytes[i]) {
+                    i += 1;
+                }
+                out.push(&text[s..i]);
+            } else {
+                i += 1;
+            }
+        }
+        out
+    }
+
+    /// Truncate `line` to exclude any suffix that starts a comment.
+    /// `line_start` is the absolute byte offset of `line[0]` in `source`.
+    fn strip_trailing_comment<'a>(
+        line: &'a str,
+        line_start: usize,
+        comments: &[(usize, usize)],
+    ) -> &'a str {
+        let line_end = line_start + line.len();
+        let mut cut = line.len();
+        for &(s, e) in comments {
+            if s >= line_end {
+                break;
+            }
+            if e > line_start && s < line_end && s >= line_start {
+                let rel = s - line_start;
+                if rel < cut {
+                    cut = rel;
+                }
+            } else if s < line_start && e > line_start {
+                // Comment started earlier and covers (part of) this line.
+                return "";
+            }
+        }
+        &line[..cut]
+    }
+
+    // Pass A: declarations and explicit type directives.
+    for (_line_no, line_start, raw_line) in iter_source_lines(source) {
+        // For directive parsing we intentionally do NOT strip the ARM `@`
+        // comment marker: dialects like GAS use `@function` / `@object` as
+        // *type kind* tokens on the same line as `.type`.
+        // We only skip lines whose content starts *inside* a block comment.
+        let raw_trim = raw_line.trim_start();
+        if raw_trim.is_empty() {
+            continue;
+        }
+        // If the very first non-ws char begins a comment region, skip.
+        let first_char_off = line_start + (raw_line.len() - raw_trim.len());
+        if is_in_comment(first_char_off, first_char_off + 1, comments) {
+            continue;
+        }
+        let line = raw_line;
+        let trimmed = line.trim_start();
+        let lower = trimmed.to_ascii_lowercase();
+
+        // GAS-like: `.extern name[, name...]`, `.global name`, `.globl name`
+        // Also `EXTERN name`, `EXTRN name` (NASM/MASM/AVR/Z80 dialects).
+        let rest_opt: Option<&str> = if lower.starts_with(".extern") {
+            Some(&trimmed[".extern".len()..])
+        } else if lower.starts_with(".globl") {
+            Some(&trimmed[".globl".len()..])
+        } else if lower.starts_with(".global") {
+            Some(&trimmed[".global".len()..])
+        } else if lower.starts_with("extern ") || lower.starts_with("extern\t") {
+            Some(&trimmed["extern".len()..])
+        } else if lower.starts_with("extrn ") || lower.starts_with("extrn\t") {
+            Some(&trimmed["extrn".len()..])
+        } else if lower.starts_with("import ") || lower.starts_with("import\t") {
+            Some(&trimmed["import".len()..])
+        } else {
+            None
+        };
+        if let Some(rest) = rest_opt {
+            for name in idents_in(rest) {
+                bump(&mut externs, name, ExternKind::Unknown);
+            }
+        }
+
+        // GAS `.type name , @function|@object|%function|%object|STT_FUNC|STT_OBJECT`
+        if lower.starts_with(".type") {
+            let rest_orig = &trimmed[".type".len()..];
+            let rest_lower = &lower[".type".len()..];
+            let names = idents_in(rest_orig);
+            let is_func = rest_lower.contains("function") || rest_lower.contains("stt_func");
+            let is_obj = rest_lower.contains("object") || rest_lower.contains("stt_object");
+            if let Some(name) = names.first() {
+                if is_func {
+                    bump(&mut externs, name, ExternKind::ExplicitFunction);
+                } else if is_obj {
+                    bump(&mut externs, name, ExternKind::ExplicitVariable);
+                }
+            }
+        }
+
+        // ARM: `.thumb_func` / `.func` applies to the *next* label; we cheaply
+        // grab the following ident on the same line if present.
+        if lower.starts_with(".thumb_func") || lower.starts_with(".func") {
+            let after = if lower.starts_with(".thumb_func") {
+                &trimmed[".thumb_func".len()..]
+            } else {
+                &trimmed[".func".len()..]
+            };
+            if let Some(name) = idents_in(after).first() {
+                bump(&mut externs, name, ExternKind::ExplicitFunction);
+            }
+        }
+
+        // MASM / NASM: `name PROC` / `name:PROC` / `name ENDP`
+        //              `name DWORD ...` / `name:DWORD ...` / `name QWORD ...` etc.
+        //              `name DB ...`, `name DW ...`, `name DD ...`, `name DQ ...`,
+        //              `name RESB ...`, `name RESW ...`, `name RESD ...`, `name RESQ ...`
+        {
+            let idents = idents_in(trimmed);
+            if idents.len() >= 2 {
+                let kw = idents[1].to_ascii_uppercase();
+                match kw.as_str() {
+                    "PROC" => bump(&mut externs, idents[0], ExternKind::ExplicitFunction),
+                    "DWORD" | "QWORD" | "WORD" | "BYTE" | "TBYTE" | "REAL4" | "REAL8"
+                    | "DB" | "DW" | "DD" | "DQ" | "DT"
+                    | "RESB" | "RESW" | "RESD" | "RESQ" | "RESD8" | "RESDQ" => {
+                        bump(&mut externs, idents[0], ExternKind::ExplicitVariable);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // Pass B: usage-based inference. Only bumps entries that already exist as
+    // extern (declared somewhere in the document); we never introduce a new
+    // extern based on use alone.
+    if externs.is_empty() {
+        return externs;
+    }
+    // Collect declared names into a set for quick lookup.
+    let declared: HashSet<String> = externs.keys().cloned().collect();
+    for (_line_no, line_start, raw_line) in iter_source_lines(source) {
+        let line = strip_trailing_comment(raw_line, line_start, comments);
+        if line.is_empty() {
+            continue;
+        }
+        let Some(mne) = line_mnemonic(line) else { continue };
+        let mne_lower = mne.to_ascii_lowercase();
+        let mne_norm = normalize_instruction_key(&mne_lower);
+        let is_call = call_like.contains(mne_lower.as_str())
+            || call_like.contains(mne_norm.as_str());
+        let is_mem = mem_like.contains(mne_lower.as_str())
+            || mem_like.contains(mne_norm.as_str());
+        if !is_call && !is_mem {
+            continue;
+        }
+        // Extract operand identifiers (skip the mnemonic itself).
+        let after_mne = match line.find(mne) {
+            Some(p) => &line[p + mne.len()..],
+            None => continue,
+        };
+        for name in idents_in(after_mne) {
+            if !declared.contains(name) {
+                continue;
+            }
+            if is_call {
+                bump(&mut externs, name, ExternKind::Function);
+            } else if is_mem {
+                bump(&mut externs, name, ExternKind::Variable);
+            }
+        }
+    }
+
+    externs
+}
+
+/// Reclassify identifier tokens whose text matches a declared extern symbol.
+///
+/// This mutates `tokens` in place, replacing the `token_type` (and clearing
+/// modifiers) for any RawToken whose byte range corresponds to an extern
+/// symbol occurrence — but only if the current token is a plain identifier
+/// classification (variable=1 or function=2 without modifiers). Label
+/// declarations (with MOD_DECL) and constants (MOD_READONLY) are preserved.
+fn apply_extern_reclassification(
+    source: &str,
+    tokens: &mut Vec<RawToken>,
+    externs: &HashMap<String, ExternKind>,
+) {
+    if externs.is_empty() {
+        return;
+    }
+    let src_bytes = source.as_bytes();
+    for tok in tokens.iter_mut() {
+        // Preserve declarations and readonly (equ/constant) classifications.
+        if tok.token_modifiers_bitset != 0 {
+            continue;
+        }
+        // Only reclassify identifier-like classifications.
+        if tok.token_type != 1 && tok.token_type != 2 {
+            continue;
+        }
+        if tok.end_byte > src_bytes.len() || tok.start_byte >= tok.end_byte {
+            continue;
+        }
+        let Ok(text) = std::str::from_utf8(&src_bytes[tok.start_byte..tok.end_byte]) else {
+            continue;
+        };
+        if let Some(kind) = externs.get(text) {
+            tok.token_type = kind.token_type();
+        }
+    }
+}
+
 /// Get semantic tokens for the document.
 pub fn get_semantic_tokens_full(
     doc: &FullTextDocument,
@@ -1743,6 +2166,13 @@ pub fn get_semantic_tokens_full(
         );
         scan_instruction_heads(source, &comment_ranges, isa, &mut tokens);
         scan_number_literals(source, &comment_ranges, &mut tokens);
+
+        // Extern symbol classification pass (applies uniformly across all
+        // supported ISAs). See `collect_extern_symbols` for the priority rules.
+        let call_like = call_like_set();
+        let mem_like = mem_like_set();
+        let externs = collect_extern_symbols(source, &comment_ranges, &call_like, &mem_like);
+        apply_extern_reclassification(source, &mut tokens, &externs);
 
         // Emit a comment token for each detected comment range (if not already
         // covered by a grammar-produced comment token at the same position).
