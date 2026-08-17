@@ -500,8 +500,14 @@ fn get_compilation_db_files(path: &Path) -> Option<CompilationDatabase> {
     // first check for compile_commands.json
     let cmp_cmd_path = path.join("compile_commands.json");
     if let Ok(conts) = std::fs::read_to_string(cmp_cmd_path)
-        && let Ok(cmds) = serde_json::from_str(&conts)
+        && let Ok(mut cmds) = serde_json::from_str::<CompilationDatabase>(&conts)
     {
+        for entry in &mut cmds {
+            if !entry.directory.is_absolute() {
+                let joined = path.join(&entry.directory);
+                entry.directory = joined.canonicalize().unwrap_or(joined);
+            }
+        }
         return Some(cmds);
     }
     // then check for compile_flags.txt
@@ -3532,6 +3538,49 @@ mod tests {
 
         let result = get_compile_cmds_from_file(&params);
         assert!(result.is_some(), "compile_commands.json should be loaded from project root");
+
+        fs::remove_dir_all(project_root).expect("temp dir should be removable");
+    }
+
+    #[test]
+    fn resolves_relative_compile_command_directory_from_project_root() {
+        let project_root = mk_temp_dir("compile-db-relative-directory");
+        let include_dir = project_root.join("include");
+        fs::create_dir_all(&include_dir).expect("include dir should be creatable");
+        let source_file = project_root.join("main.S");
+        fs::write(&source_file, "").expect("source file should be writable");
+
+        let compile_db = r#"[
+            {
+                "directory": ".",
+                "file": "main.S",
+                "arguments": ["clang", "-Iinclude", "main.S"]
+            }
+        ]"#;
+        fs::write(project_root.join("compile_commands.json"), compile_db)
+            .expect("compile_commands.json should be writable");
+
+        let params: InitializeParams = serde_json::from_value(json!({
+            "capabilities": {},
+            "workspaceFolders": [
+                {
+                    "uri": mk_file_uri(&project_root),
+                    "name": "ws"
+                }
+            ]
+        }))
+        .expect("initialize params should deserialize");
+
+        let db = get_compile_cmds_from_file(&params)
+            .expect("compile_commands.json should be loaded from project root");
+        let includes = get_additional_include_dirs(&db);
+        let include_dir = include_dir
+            .canonicalize()
+            .expect("include dir should be canonicalizable");
+        assert!(
+            includes.iter().any(|(_, p)| p == &include_dir),
+            "relative entry.directory should resolve against project root for include extraction"
+        );
 
         fs::remove_dir_all(project_root).expect("temp dir should be removable");
     }
