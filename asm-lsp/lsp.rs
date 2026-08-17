@@ -367,6 +367,20 @@ fn get_default_include_dirs() -> Vec<PathBuf> {
 fn get_additional_include_dirs(compile_cmds: &CompilationDatabase) -> Vec<(SourceFile, PathBuf)> {
     let mut additional_dirs = Vec::new();
 
+    let maybe_push_include_dir =
+        |source_file: &SourceFile, entry_dir: &Path, dir: &str| -> Option<(SourceFile, PathBuf)> {
+            let include_path = PathBuf::from(dir);
+            if include_path.is_absolute() {
+                Some((source_file.clone(), include_path))
+            } else {
+                entry_dir
+                    .join(include_path)
+                    .canonicalize()
+                    .ok()
+                    .map(|full_path| (source_file.clone(), full_path))
+            }
+        };
+
     for entry in compile_cmds {
         let Ok(entry_dir) = entry.directory.canonicalize() else {
             continue;
@@ -395,38 +409,29 @@ fn get_additional_include_dirs(compile_cmds: &CompilationDatabase) -> Vec<(Sourc
                 CompileArgs::Flags(args) | CompileArgs::Arguments(args) => {
                     for arg in args.iter().map(|arg| arg.trim()) {
                         if check_dir {
-                            // current arg is preceeded by lone '-I'
-                            let dir = PathBuf::from(arg);
-                            if dir.is_absolute() {
-                                additional_dirs.push((source_file.clone(), dir));
-                            } else if let SourceFile::File(ref source_path) = source_file {
-                                if let Ok(full_include_path) = source_path.join(dir).canonicalize()
-                                {
-                                    additional_dirs.push((source_file.clone(), full_include_path));
-                                }
-                            } else {
-                                warn!(
-                                    "Additional relative include directories cannot be extracted for a compilation database entry targeting 'All'"
-                                );
+                            // current arg is preceeded by a lone include flag
+                            if let Some(include_dir) =
+                                maybe_push_include_dir(&source_file, &entry_dir, arg)
+                            {
+                                additional_dirs.push(include_dir);
                             }
                             check_dir = false;
-                        } else if arg.eq("-I") {
+                        } else if arg.eq("-I") || arg.eq("-isystem") {
                             // -Irelative is stored as two separate args if parsed from `compile_flags.txt`
                             check_dir = true;
                         } else if arg.len() > 2 && arg.starts_with("-I") {
                             // '-Irelative'
-                            let dir = PathBuf::from(&arg[2..]);
-                            if dir.is_absolute() {
-                                additional_dirs.push((source_file.clone(), dir));
-                            } else if let SourceFile::File(ref source_path) = source_file {
-                                if let Ok(full_include_path) = source_path.join(dir).canonicalize()
-                                {
-                                    additional_dirs.push((source_file.clone(), full_include_path));
-                                }
-                            } else {
-                                warn!(
-                                    "Additional relative include directories cannot be extracted for a compilation database entry targeting 'All'"
-                                );
+                            if let Some(include_dir) =
+                                maybe_push_include_dir(&source_file, &entry_dir, &arg[2..])
+                            {
+                                additional_dirs.push(include_dir);
+                            }
+                        } else if arg.len() > 8 && arg.starts_with("-isystem") {
+                            // '-isystemrelative'
+                            if let Some(include_dir) =
+                                maybe_push_include_dir(&source_file, &entry_dir, &arg[8..])
+                            {
+                                additional_dirs.push(include_dir);
                             }
                         }
                     }
@@ -435,17 +440,28 @@ fn get_additional_include_dirs(compile_cmds: &CompilationDatabase) -> Vec<(Sourc
         } else if entry.command.is_some()
             && let Some(args) = entry.args_from_cmd()
         {
+            let mut check_dir = false;
             for arg in args {
-                if arg.starts_with("-I") && arg.len() > 2 {
+                if check_dir {
+                    if let Some(include_dir) = maybe_push_include_dir(&source_file, &entry_dir, &arg)
+                    {
+                        additional_dirs.push(include_dir);
+                    }
+                    check_dir = false;
+                } else if arg.eq("-I") || arg.eq("-isystem") {
+                    check_dir = true;
+                } else if arg.starts_with("-I") && arg.len() > 2 {
                     // "All paths specified in the `command` or `file` fields must be either absolute or relative to..." the `directory` field
-                    let incl_path = PathBuf::from(&arg[2..]);
-                    if incl_path.is_absolute() {
-                        additional_dirs.push((source_file.clone(), incl_path));
-                    } else {
-                        let dir = entry_dir.join(incl_path);
-                        if let Ok(full_include_path) = dir.canonicalize() {
-                            additional_dirs.push((source_file.clone(), full_include_path));
-                        }
+                    if let Some(include_dir) =
+                        maybe_push_include_dir(&source_file, &entry_dir, &arg[2..])
+                    {
+                        additional_dirs.push(include_dir);
+                    }
+                } else if arg.starts_with("-isystem") && arg.len() > 8 {
+                    if let Some(include_dir) =
+                        maybe_push_include_dir(&source_file, &entry_dir, &arg[8..])
+                    {
+                        additional_dirs.push(include_dir);
                     }
                 }
             }
@@ -3369,8 +3385,10 @@ fn get_project_root(params: &InitializeParams) -> Option<PathBuf> {
     if let Some(folders) = &params.workspace_folders {
         // if there's multiple, just visit in order until we find a valid folder
         for folder in folders {
-            let Ok(parsed) = PathBuf::from_str(folder.uri.path().as_str());
-            if let Ok(parsed_path) = parsed.canonicalize() {
+            let parsed_path = match process_uri(&folder.uri) {
+                UriConversion::Canonicalized(path) | UriConversion::Unchecked(path) => path,
+            };
+            if parsed_path.is_dir() {
                 info!("Detected project root: {}", parsed_path.display());
                 return Some(parsed_path);
             }
@@ -3380,8 +3398,10 @@ fn get_project_root(params: &InitializeParams) -> Option<PathBuf> {
     // if workspace folders weren't set or came up empty, we check the root_uri
     #[allow(deprecated)]
     if let Some(root_uri) = &params.root_uri {
-        let Ok(parsed) = PathBuf::from_str(root_uri.path().as_str());
-        if let Ok(parsed_path) = parsed.canonicalize() {
+        let parsed_path = match process_uri(root_uri) {
+            UriConversion::Canonicalized(path) | UriConversion::Unchecked(path) => path,
+        };
+        if parsed_path.is_dir() {
             info!("Detected project root: {}", parsed_path.display());
             return Some(parsed_path);
         }
@@ -3460,4 +3480,124 @@ pub fn instr_filter_targets(instr: &Instruction, config: &Config) -> Instruction
 
     instr.forms = forms;
     instr
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, time::{SystemTime, UNIX_EPOCH}};
+
+    use compile_commands::{CompileArgs, CompileCommand, SourceFile};
+    use lsp_types::InitializeParams;
+    use serde_json::json;
+
+    use super::{get_additional_include_dirs, get_compile_cmds_from_file};
+
+    fn mk_temp_dir(prefix: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("asm-lsp-{prefix}-{nanos}"));
+        fs::create_dir_all(&path).expect("temp dir should be creatable");
+        path
+    }
+
+    fn mk_file_uri(path: &std::path::Path) -> String {
+        format!("file:///{}", path.to_string_lossy().replace('\\', "/"))
+    }
+
+    #[test]
+    fn loads_compile_commands_from_project_root_workspace_folder() {
+        let project_root = mk_temp_dir("compile-db-root");
+        let source_file = project_root.join("main.S");
+        fs::write(&source_file, "").expect("source file should be writable");
+
+        let compile_db = format!(
+            "[{{\"directory\":\"{}\",\"file\":\"main.S\",\"arguments\":[\"clang\",\"-Iinclude\",\"main.S\"]}}]",
+            project_root.to_string_lossy().replace('\\', "\\\\")
+        );
+        fs::write(project_root.join("compile_commands.json"), compile_db)
+            .expect("compile_commands.json should be writable");
+
+        let params: InitializeParams = serde_json::from_value(json!({
+            "capabilities": {},
+            "workspaceFolders": [
+                {
+                    "uri": mk_file_uri(&project_root),
+                    "name": "ws"
+                }
+            ]
+        }))
+        .expect("initialize params should deserialize");
+
+        let result = get_compile_cmds_from_file(&params);
+        assert!(result.is_some(), "compile_commands.json should be loaded from project root");
+
+        fs::remove_dir_all(project_root).expect("temp dir should be removable");
+    }
+
+    #[test]
+    fn extracts_relative_include_dirs_from_arguments_using_entry_directory() {
+        let project_root = mk_temp_dir("compile-db-includes");
+        let include_dir = project_root.join("include");
+        fs::create_dir_all(&include_dir).expect("include dir should be creatable");
+        let source_file = project_root.join("main.S");
+        fs::write(&source_file, "").expect("source file should be writable");
+
+        let db = vec![CompileCommand {
+            file: SourceFile::File(std::path::PathBuf::from("main.S")),
+            directory: project_root.clone(),
+            arguments: Some(CompileArgs::Arguments(vec![
+                "clang".to_string(),
+                "-Iinclude".to_string(),
+                "main.S".to_string(),
+            ])),
+            command: None,
+            output: None,
+        }];
+
+        let includes = get_additional_include_dirs(&db);
+        let include_dir = include_dir
+            .canonicalize()
+            .expect("include dir should be canonicalizable");
+        assert!(
+            includes.iter().any(|(_, p)| p == &include_dir),
+            "relative -I include dir should resolve against compile command directory"
+        );
+
+        fs::remove_dir_all(project_root).expect("temp dir should be removable");
+    }
+
+    #[test]
+    fn extracts_isystem_include_dirs_from_arguments() {
+        let project_root = mk_temp_dir("compile-db-isystem");
+        let include_dir = project_root.join("system-include");
+        fs::create_dir_all(&include_dir).expect("include dir should be creatable");
+        let source_file = project_root.join("main.S");
+        fs::write(&source_file, "").expect("source file should be writable");
+
+        let db = vec![CompileCommand {
+            file: SourceFile::File(std::path::PathBuf::from("main.S")),
+            directory: project_root.clone(),
+            arguments: Some(CompileArgs::Arguments(vec![
+                "clang".to_string(),
+                "-isystem".to_string(),
+                "system-include".to_string(),
+                "main.S".to_string(),
+            ])),
+            command: None,
+            output: None,
+        }];
+
+        let includes = get_additional_include_dirs(&db);
+        let include_dir = include_dir
+            .canonicalize()
+            .expect("include dir should be canonicalizable");
+        assert!(
+            includes.iter().any(|(_, p)| p == &include_dir),
+            "-isystem include dir should be extracted"
+        );
+
+        fs::remove_dir_all(project_root).expect("temp dir should be removable");
+    }
 }
